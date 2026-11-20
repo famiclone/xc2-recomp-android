@@ -315,11 +315,21 @@ int vk_astc_mode(void) {
             if (want == VK_ASTC_NATIVE) rt_log("vk: XC2_ASTC=native: the device lacks textureCompressionASTC_LDR; gpu");
             m = want == VK_ASTC_CPU ? VK_ASTC_CPU : want == VK_ASTC_CHECK ? VK_ASTC_CHECK : VK_ASTC_GPU;
         }
+#ifdef __ANDROID__
+        // Adreno 740 decodes all 2D ASTC LDR formats in hardware; skip eager compute pipeline compilation at boot
+        // when VK_ASTC_NATIVE is active and build it lazily in vk_astc_gpu() only if a non-native format asks for it.
+        if ((m == VK_ASTC_GPU || m == VK_ASTC_CHECK) && !G.pipe && !G.failed &&
+            !create_pipeline(c)) {
+            G.failed = 1;
+            rt_log("vk: ASTC compute decoder unavailable on %s: ASTC decodes on the CPU", c->props.deviceName);
+        }
+#else
         if ((m == VK_ASTC_GPU || m == VK_ASTC_CHECK || m == VK_ASTC_NATIVE) && !G.pipe && !G.failed &&
             !create_pipeline(c)) {
             G.failed = 1;
             rt_log("vk: ASTC compute decoder unavailable on %s: ASTC decodes on the CPU", c->props.deviceName);
         }
+#endif
         if (G.failed && m != VK_ASTC_NATIVE) m = VK_ASTC_CPU;
         G.mode = m;
         rt_log("vk: ASTC textures: %s (textureCompressionASTC_LDR %d)", mode_name(m), native_device(c));
@@ -345,7 +355,22 @@ int vk_astc_gpu(void) {
     if (m != VK_ASTC_NATIVE) return 0;
     plat_mutex_lock_shared(&g_lock);   // native mode, a format the device lacks: the decoder when it exists
     int ok = G.pipe != VK_NULL_HANDLE;
+#ifdef __ANDROID__
+    int need_lazy = !ok && !G.failed;
+#endif
     plat_mutex_unlock_shared(&g_lock);
+#ifdef __ANDROID__
+    if (need_lazy) {
+        VkCtx *c = vk_ctx();
+        if (c) {
+            plat_mutex_lock(&g_lock);
+            reset_for(c);
+            if (!G.pipe && !G.failed && !create_pipeline(c)) G.failed = 1;
+            ok = G.pipe != VK_NULL_HANDLE;
+            plat_mutex_unlock(&g_lock);
+        }
+    }
+#endif
     return ok;
 }
 

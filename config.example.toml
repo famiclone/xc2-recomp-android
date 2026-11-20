@@ -7,6 +7,8 @@ base = 'C:\Games\XC2\base.nsp'
 # Cumulative update NSPs, title id 0100E95004038800 (Japan: 0100F3400332C800). Each is identified by its code hash;
 # 3.0.1 is supported.
 updates = ['C:\Games\XC2\update-3.0.1.nsp']
+# Optional: add-on content (DLC) NSPs, title ids 0100E95004039001..0100E95004039063 (e.g. Expansion Pass / Torna).
+# dlcs = ['C:\Games\XC2\dlc-torna.nsp']
 # Keys dumped from your own console. Never printed or copied by the tools.
 keys = 'C:\Switch\prod.keys'
 # Optional: a firmware NCA directory (an unpacked firmware, or an emulator's installed registered/ directory).

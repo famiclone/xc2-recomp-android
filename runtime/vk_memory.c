@@ -10,6 +10,21 @@
 // destruction) @ da35b83a (MIT, Copyright (c) 2026 Peiikai). MNG aliases host VM (mach_vm_remap) and protects pages
 // (fault handler); here virtual pools are a GPU-side page table over device-local memory and dirty pages come from
 // GetWriteWatch (mem_written_pages), so neither is needed.
+#ifdef __linux__
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sys/mman.h>
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+#ifndef MREMAP_MAYMOVE
+#define MREMAP_MAYMOVE 1
+#endif
+#ifndef MREMAP_FIXED
+#define MREMAP_FIXED 2
+#endif
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,11 +79,19 @@ typedef struct PoolRec {
     uint8_t *smap;                     // its mapping; offsets as in buf (from import_lo)
     uint32_t sgen;                     // gen_lock: every page write stamped up to this generation is in the shadow
     volatile uint8_t stouched;         // on the touched list: the GPU may use it in the submission being recorded
+    // Unified Vulkan backing (XC2_MEMORY=unified_vulkan / Android default): buf's VkDeviceMemory is mremap'd directly
+    // onto [import_lo, import_hi) in guest VA space, freeing the anonymous pages behind it (zero copy, zero host-import).
+    void *umat_hold;                   // PROT_NONE reservation keeping vkMapMemory's original VA slot for vkUnmapMemory
+    uint8_t umat_active;
+    volatile uint8_t dyn_flushed;      // 1 once nvnMemoryPoolFlushMappedRange touched this pool
 } PoolRec;
 
 static void mirror_forget(PoolRec *r);   // pool_lock exclusive: off the mirrored list
 static int shadow_on;                    // shadow mode: imported pools get shadow storage instead (vk_mem_class_log)
+static int unified_on;                   // unified_vulkan mode: guest VA backed directly by mapped VkDeviceMemory
+static volatile uint64_t dyn_gen = 1;    // bumped when a pool becomes dyn_flushed
 static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size);
+static int unified_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size);
 static void shadow_touch(PoolRec *r);
 static void shadow_forget(PoolRec *r);
 static void mirror_retiring(PoolRec *r);  // vk_pool_fini: kept until mirror_retire (or vk_mem_shutdown)
@@ -108,9 +131,123 @@ static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want
     return -1;
 }
 
-// CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host).
+// CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host), or on
+// unified-memory Android SoCs the buffer's mapped VkDeviceMemory is remapped directly onto the guest VA range.
+static int import_pool_ext(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size);
+
+#ifdef __linux__
+static int unified_memory_type(const VkCtx *c, uint32_t bits) {
+    static const VkMemoryPropertyFlags tries[] = {
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+    };
+    for (size_t k = 0; k < sizeof tries / sizeof *tries; k++)
+        for (uint32_t i = 0; i < c->mem_props.memoryTypeCount; i++)
+            if ((bits >> i & 1) && (c->mem_props.memoryTypes[i].propertyFlags & tries[k]) == tries[k])
+                return (int)i;
+    return -1;
+}
+
+static int unified_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
+    static int mremap_unsupported;
+    if (__atomic_load_n(&mremap_unsupported, __ATOMIC_ACQUIRE))
+        return c->has_external_memory_host ? import_pool_ext(c, r, addr, size) : shadow_pool(c, r, addr, size);
+    r->import_lo = addr & ~0xfffull;
+    r->import_hi = (addr + size + 0xfff) & ~0xfffull;
+    uint64_t n = r->import_hi - r->import_lo;
+    if (!n) return 0;
+    plat_mutex_lock_shared(&pool_lock);
+    int ui = pidx_upper(&pool_index, r->import_lo);
+    int overlap = (ui > 0 && pool_index.maxhi[ui - 1] > r->import_lo) ||
+                  (ui < pool_index.n && pool_index.e[ui].lo < r->import_hi);
+    plat_mutex_unlock_shared(&pool_lock);
+    if (overlap) {
+        return c->has_external_memory_host ? import_pool_ext(c, r, addr, size) : shadow_pool(c, r, addr, size);
+    }
+    mem_thaw(r->import_lo, n);
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n,
+                             .usage = pool_usage(c), .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkResult res = vkCreateBuffer(c->device, &bi, NULL, &r->buf);
+    if (res != VK_SUCCESS) {
+        rt_log("vk: pool %#llx: unified vkCreateBuffer failed (%d)", (unsigned long long)addr, (int)res);
+        return 0;
+    }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(c->device, r->buf, &req);
+    int type = unified_memory_type(c, req.memoryTypeBits);
+    uint64_t alloc_sz = req.size > n ? (req.size + 0xfff) & ~0xfffull : n;
+    if (type < 0) {
+        vkDestroyBuffer(c->device, r->buf, NULL);
+        r->buf = VK_NULL_HANDLE;
+        return c->has_external_memory_host ? import_pool_ext(c, r, addr, size) : shadow_pool(c, r, addr, size);
+    }
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = alloc_sz,
+                               .memoryTypeIndex = (uint32_t)type};
+    void *vk_ptr = NULL;
+    if ((res = vkAllocateMemory(c->device, &ai, NULL, &r->mem)) != VK_SUCCESS ||
+        (res = vkBindBufferMemory(c->device, r->buf, r->mem, 0)) != VK_SUCCESS ||
+        (res = vkMapMemory(c->device, r->mem, 0, n, 0, &vk_ptr)) != VK_SUCCESS ||
+        ((uintptr_t)vk_ptr & 0xfff) != 0) {
+        if (vk_ptr) vkUnmapMemory(c->device, r->mem);
+        if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
+        vkDestroyBuffer(c->device, r->buf, NULL);
+        r->buf = VK_NULL_HANDLE, r->mem = VK_NULL_HANDLE;
+        return c->has_external_memory_host ? import_pool_ext(c, r, addr, size) : shadow_pool(c, r, addr, size);
+    }
+    // Linux mm/mremap.c unmaps the MREMAP_FIXED destination BEFORE checking whether the source VMA supports mremap
+    // (Qualcomm KGSL sets vm_ops that reject mremap). Probe onto a throwaway anonymous range first so guest pages at
+    // r->import_lo are never unmapped if the GPU driver VMA refuses mremap.
+    void *probe = mmap(NULL, (size_t)n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    void *mv = probe != MAP_FAILED
+                   ? mremap(vk_ptr, (size_t)n, (size_t)n, MREMAP_MAYMOVE | MREMAP_FIXED, probe)
+                   : MAP_FAILED;
+    if (mv != probe) {
+        if (probe != MAP_FAILED) munmap(probe, (size_t)n);
+        __atomic_store_n(&mremap_unsupported, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&unified_on, 0, __ATOMIC_RELEASE);
+        if (!c->has_external_memory_host) __atomic_store_n(&shadow_on, 1, __ATOMIC_RELEASE);
+        static int warned;
+        if (!warned++) rt_log("mem: unified_vulkan mremap unsupported by GPU driver; falling back to %s",
+                              c->has_external_memory_host ? "host import" : "shadow pool");
+        vkUnmapMemory(c->device, r->mem);
+        vkFreeMemory(c->device, r->mem, NULL);
+        vkDestroyBuffer(c->device, r->buf, NULL);
+        r->buf = VK_NULL_HANDLE, r->mem = VK_NULL_HANDLE;
+        return c->has_external_memory_host ? import_pool_ext(c, r, addr, size) : shadow_pool(c, r, addr, size);
+    }
+    memcpy(probe, (const void *)(uintptr_t)r->import_lo, (size_t)n);
+    mv = mremap(probe, (size_t)n, (size_t)n, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)(uintptr_t)r->import_lo);
+    if (mv == MAP_FAILED) {
+        rt_fatal("vk: unified_vulkan second mremap onto %#llx+%#llx failed", (unsigned long long)r->import_lo,
+                 (unsigned long long)n);
+    }
+    void *hold = mmap(vk_ptr, (size_t)n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (hold == vk_ptr) r->umat_hold = hold;
+    else if (hold != MAP_FAILED) munmap(hold, (size_t)n);
+    r->umat_active = 1;
+    plat_mem_disarm(r->import_lo, n);
+    plat_inc32(&n_imports);
+    return 1;
+}
+#else
+static int unified_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
+    return import_pool_ext(c, r, addr, size);
+}
+#endif
+
 static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
+    if (unified_on) return unified_pool(c, r, addr, size);
     if (shadow_on) return shadow_pool(c, r, addr, size);
+    return import_pool_ext(c, r, addr, size);
+}
+
+static int import_pool_ext(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
+    if (!c->has_external_memory_host) return shadow_pool(c, r, addr, size);
     if (!p_host_props)
         p_host_props = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(c->device, "vkGetMemoryHostPointerPropertiesEXT");
     uint64_t al = c->min_imported_host_alignment ? c->min_imported_host_alignment : 0x1000;
@@ -232,6 +369,25 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->mbuf) vmaDestroyBuffer(c->vma, r->mbuf, r->malloc_);
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
+#ifdef __linux__
+    if (r->umat_active) {
+        uint64_t n = r->import_hi - r->import_lo;
+        mem_thaw(r->import_lo, n);
+        void *anon = mmap(NULL, (size_t)n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (anon != MAP_FAILED) memcpy(anon, (const void *)(uintptr_t)r->import_lo, (size_t)n);
+        if (r->umat_hold) {
+            mremap((void *)(uintptr_t)r->import_lo, (size_t)n, (size_t)n, MREMAP_MAYMOVE | MREMAP_FIXED, r->umat_hold);
+            vkUnmapMemory(c->device, r->mem);
+            if (anon != MAP_FAILED)
+                mremap(anon, (size_t)n, (size_t)n, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)(uintptr_t)r->import_lo);
+        } else {
+            if (anon != MAP_FAILED)
+                mremap(anon, (size_t)n, (size_t)n, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)(uintptr_t)r->import_lo);
+            r->mem = VK_NULL_HANDLE;   // original driver VA slot was taken: do not let vkFreeMemory munmap it
+        }
+        plat_mem_disarm(r->import_lo, n);
+    }
+#endif
     if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     free(r->pt);
@@ -500,9 +656,17 @@ static void shadow_log(uint64_t frame);
 static int dead_pending(void);
 
 static void vram_log(uint64_t frame);
+#ifdef __ANDROID__
+static void android_trim_staging(uint64_t frame);
+#endif
 
 void vk_mem_census(uint64_t frame) {
     static uint64_t window_start;
+    VkCtx *vc = vk_ctx();
+    if (vc && vc->vma) vmaSetCurrentFrameIndex(vc->vma, (uint32_t)frame);
+#ifdef __ANDROID__
+    if (frame % 60 == 0) android_trim_staging(frame);
+#endif
     if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800)
@@ -576,6 +740,31 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
         if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
             *used += vb[h].statistics.blockBytes, *budget += mp->memoryHeaps[h].size;
     return *budget != 0;
+}
+
+int vk_mem_vma_stats(float *alloc_mb, float *block_mb, float *budget_mb) {
+    if (alloc_mb) *alloc_mb = -1;
+    if (block_mb) *block_mb = -1;
+    if (budget_mb) *budget_mb = -1;
+    VkCtx *c = vk_ctx();
+    if (!c || !c->vma) return 0;
+    VmaBudget vb[VK_MAX_MEMORY_HEAPS];
+    vmaGetHeapBudgets(c->vma, vb);
+    uint64_t alloc = 0, blocks = 0, budget = 0;
+    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++) {
+        alloc += vb[h].statistics.allocationBytes;
+        blocks += vb[h].statistics.blockBytes;
+        if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            budget += vb[h].budget ? vb[h].budget : c->mem_props.memoryHeaps[h].size;
+    }
+    if (!budget) {
+        for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+            budget += vb[h].budget ? vb[h].budget : c->mem_props.memoryHeaps[h].size;
+    }
+    if (alloc_mb) *alloc_mb = (float)((double)alloc / 1048576.0);
+    if (block_mb) *block_mb = (float)((double)blocks / 1048576.0);
+    if (budget_mb && budget) *budget_mb = (float)((double)budget / 1048576.0);
+    return 1;
 }
 
 // ---------------------------------------------------------------- page write generations
@@ -929,6 +1118,7 @@ static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     r->sgen = gen_now;   // the copy below holds every write stamped so far; later stamps are copied again
     plat_mutex_unlock(&gen_lock);
     memcpy(r->smap, (const void *)(uintptr_t)r->import_lo, n);
+    __atomic_store_n(&shadow_on, 1, __ATOMIC_RELEASE);
     plat_mutex_lock(&shadow_lock);
     s_live_n++, s_live_bytes += (int64_t)n;
     plat_mutex_unlock(&shadow_lock);
@@ -979,7 +1169,17 @@ static void shadow_sync_pool(PoolRec *r) {
         if (mem_frozen(a)) { a = b; continue; }
         while (b < hi && !mem_frozen(b)) b = b + (1ull << REG_SHIFT) < hi ? b + (1ull << REG_SHIFT) : hi;
         s_queries++;
-        if (!query_stamp(a, b, g)) tracked = 0;
+        int ok = query_stamp(a, b, g);
+        if (!ok) tracked = 0;
+        else if (freeze_idle) {
+            for (uint64_t j = a >> REG_SHIFT; j <= (b - 1) >> REG_SHIFT; j++) {
+                if (ww_ep - reg_last[j] >= (uint32_t)freeze_idle && ww_ep - reg_tried[j] >= (uint32_t)freeze_idle) {
+                    reg_tried[j] = ww_ep;
+                    if (nfcand == cfcand) grow((void **)&fcand, &cfcand, sizeof *fcand);
+                    fcand[nfcand++] = (uint32_t)j;
+                }
+            }
+        }
         a = b;
     }
     uint32_t since = r->sgen;
@@ -1352,29 +1552,37 @@ static void wbf_prune(uint64_t done) {
 static void mirror_mode(int discrete) {
     const char *e = cfg_value("XC2_MEMORY");
     const char *sh = cfg_get("XC2_SHADOW");
-#ifdef _WIN32
+    unified_on = 0;
+#ifdef __ANDROID__
+    shadow_on = sh && *sh && strcmp(sh, "0");
+    if (!shadow_on && (!strcmp(e, "auto") || !strcmp(e, "unified_vulkan"))) unified_on = 1;
+#elif defined(_WIN32)
     shadow_on = sh && *sh && strcmp(sh, "0");
 #else
-    shadow_on = !sh || !*sh || strcmp(sh, "0");
+    if (!strcmp(e, "unified_vulkan")) {
+        unified_on = 1;
+        shadow_on = 0;
+    } else {
+        shadow_on = !sh || !*sh || strcmp(sh, "0");
+    }
 #endif
     // 0 import, 1 mirror, 2 verify. Mirror on integrated GPUs too: there the point is not bandwidth but the staged
     // uploads, which let the frame guard go (Iris Xe, first battle: 45 fps with import, 59 with mirror, for 1.3 GiB more
-    // system memory). Not with shadow storage (the default off Windows): the guard stays on there (nvn_reads_snapshot),
-    // so the mirror would only cost memory. Nor below UMA_MIRROR_MB of system memory: the game alone holds about 5.6 GiB
-    // and the device budget, which is that same memory, let all 1.3 GiB of mirrors in with 2 GiB left (XC2_VRAM_LIMIT on
-    // the Iris Xe), so an 8 GB machine would page instead of losing a quarter of its frame rate.
+    // system memory). Not with shadow storage or unified_vulkan: the 1.3 GiB duplicate would defeat 8 GB unified RAM.
 #define UMA_MIRROR_MB 11000.0f   // a "12 GB" machine reports a little less
     float ram_used, ram_total = 0, ram_proc;
     if (!discrete) plat_mem_info(&ram_used, &ram_total, &ram_proc);
-    int mode = discrete || (!shadow_on && ram_total >= UMA_MIRROR_MB);
+    int mode = !unified_on && (discrete || (!shadow_on && ram_total >= UMA_MIRROR_MB));
     char uma_why[96];
     snprintf(uma_why, sizeof uma_why, "auto, uma with %.1f GiB of system memory", ram_total / 1024.0f);
-    const char *why = discrete ? "auto, discrete gpu" : shadow_on ? "auto, uma with shadow storage" : uma_why;
-    if (strcmp(e, "auto")) {
+    const char *why = unified_on ? (!strcmp(e, "unified_vulkan") ? "XC2_MEMORY=unified_vulkan" : "auto, android unified_vulkan")
+                    : discrete ? "auto, discrete gpu" : shadow_on ? "auto, uma with shadow storage" : uma_why;
+    if (strcmp(e, "auto") && strcmp(e, "unified_vulkan")) {
+        unified_on = 0;
         if (!strcmp(e, "import")) mode = 0, why = "XC2_MEMORY=import";
         else if (!strcmp(e, "mirror")) mode = 1, why = "XC2_MEMORY=mirror";
         else if (!strcmp(e, "verify")) mode = 2, why = "XC2_MEMORY=verify";
-        else rt_log("mem: XC2_MEMORY=%s is not import, mirror, verify or auto: auto", e);
+        else rt_log("mem: XC2_MEMORY=%s is not import, mirror, verify, unified_vulkan or auto: auto", e);
     }
     vk_mirror_on = mode > 0;
     mirror_verify = mode == 2;
@@ -1388,10 +1596,12 @@ static void mirror_mode(int discrete) {
     freeze_idle = fi && *fi ? atoi(fi) : 60;
     if (freeze_idle < 0) freeze_idle = 0;
     // Freezing stays on by default; a capture holds it off while it runs (vk_mem_capture_hold).
-    if (shadow_on) rt_log("mem: shadow storage: CPU-visible pools are host-visible copies of guest memory, not imports%s",
-                          sh && *sh ? " (XC2_SHADOW)" : "");
-    rt_log("mem: mode %s (%s): %s", mode == 2 ? "verify" : mode ? "mirror" : "import", why,
-           mode ? "pools used as buffers get a device-local mirror" : "every CPU-visible pool is imported host memory");
+    if (unified_on) rt_log("mem: unified_vulkan (%s): CPU-visible pools are zero-copy mapped VkDeviceMemory", why);
+    else if (shadow_on) rt_log("mem: shadow storage: CPU-visible pools are host-visible copies of guest memory, not imports%s",
+                               sh && *sh ? " (XC2_SHADOW)" : "");
+    if (!unified_on)
+        rt_log("mem: mode %s (%s): %s", mode == 2 ? "verify" : mode ? "mirror" : "import", why,
+               mode ? "pools used as buffers get a device-local mirror" : "every CPU-visible pool is imported host memory");
 }
 
 static void range_add(MRange **a, int *n, int *cap, PoolRec *r, uint64_t off, uint64_t size) {
@@ -1745,8 +1955,44 @@ void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
     range_add(&wbl, &nwbl, &cwbl, r, sp->offset, size);
 }
 
+int vk_mem_unified_on(void) { return unified_on; }
+
+int vk_mem_pool_dynamic(uint64_t addr) {
+    if (!unified_on) return 0;
+    typedef struct { uint64_t gen, lo, hi; int dyn; } DynHit;
+    static _Thread_local DynHit dhit[64];
+    uint64_t g = __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE) ^
+                 (__atomic_load_n(&dyn_gen, __ATOMIC_ACQUIRE) * 0x9e3779b97f4a7c15ull);
+    DynHit *h = &dhit[(addr >> 20 ^ addr >> 28) & 63];
+    if (h->gen == g && addr >= h->lo && addr < h->hi) return h->dyn;
+    plat_mutex_lock_shared(&pool_lock);
+    const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, 1);
+    const PoolRec *r = e ? e->buf : NULL;
+    int dyn = r && r->kind == POOL_IMPORT &&
+              (r->dyn_flushed ||
+               !(r->flags & (NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)));
+    if (e && r) {
+        int i = (int)(e - pool_index.e);
+        if ((i == 0 || pool_index.maxhi[i - 1] <= e->lo) && (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= e->hi))
+            *h = (DynHit){g, e->lo, e->hi, dyn};
+    }
+    plat_mutex_unlock_shared(&pool_lock);
+    return dyn;
+}
+
 void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
-    if (!vk_mirror_on || !size || !p->mem) return;
+    if ((!vk_mirror_on && !unified_on) || !size || !p->mem) return;
+    if (unified_on) {
+        plat_mutex_lock_shared(&pool_lock);
+        const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)p->mem, 0);
+        PoolRec *r = e && e->key == p ? e->buf : NULL;
+        if (r && !__atomic_load_n(&r->dyn_flushed, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&r->dyn_flushed, 1, __ATOMIC_RELEASE);
+            __atomic_add_fetch(&dyn_gen, 1, __ATOMIC_RELEASE);
+        }
+        plat_mutex_unlock_shared(&pool_lock);
+        if (!vk_mirror_on) return;
+    }
     plat_inc64(&m_flush_calls);
     plat_add64(&m_flush_bytes, (int64_t)size);
     plat_mutex_lock_shared(&pool_lock);
@@ -2271,8 +2517,13 @@ void vk_upload_end(void) { plat_rmutex_unlock(&cmd_lock); }
 // the headroom thread (vk_headroom.c) or a burst of uploads held every staging allocation of the render thread: one
 // took 47-50 ms, for a few bytes, in the first frame after a save load. Larger buffers than a block go to the default
 // pool.
+#ifdef __ANDROID__
+#define STG_BLOCK (16ull << 20)
+#define STG_MIN_BLOCKS 1
+#else
 #define STG_BLOCK (64ull << 20)
 #define STG_MIN_BLOCKS 2
+#endif
 static VmaPool stg_pool;
 static int stg_pool_tried;
 
@@ -2385,6 +2636,26 @@ void vk_mem_collect(void) {
     collect_locked(c);
     plat_rmutex_unlock(&cmd_lock);
 }
+
+#ifdef __ANDROID__
+// Reclaim completed upload batches and idle dynamic staging arenas every 60 frames to stay under Android lmkd limits.
+static void android_trim_staging(uint64_t frame) {
+    (void)frame;
+    vk_mem_collect();
+    VkCtx *c = vk_ctx();
+    if (!c || !c->vma) return;
+    StageArena *drop = NULL;
+    plat_mutex_lock(&stage_lock);
+    drop = stage_free;
+    stage_free = NULL;
+    plat_mutex_unlock(&stage_lock);
+    for (StageArena *a = drop, *next; a; a = next) {
+        next = a->next;
+        vmaDestroyBuffer(c->vma, a->buf, a->alloc);
+        free(a);
+    }
+}
+#endif
 
 void vk_mem_stats(VkMemStats *s) {
     memset(s, 0, sizeof *s);

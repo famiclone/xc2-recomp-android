@@ -5,6 +5,8 @@
 #include <string.h>
 #if defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
+#elif defined(__ANDROID__)
+#include <sys/system_properties.h>
 #endif
 
 #include "cfg.h"
@@ -26,13 +28,23 @@ void sysinfo_cpu_name(char *out, size_t n) {
     while (*p == ' ') p++;
     snprintf(out, n, "%s", p);
     for (char *e = out + strlen(out); e > out && e[-1] == ' '; e--) e[-1] = 0;
+#elif defined(__ANDROID__)
+    char soc[PROP_VALUE_MAX] = "", mfr[PROP_VALUE_MAX] = "";
+    __system_property_get("ro.soc.model", soc);
+    __system_property_get("ro.soc.manufacturer", mfr);
+    if (soc[0] && mfr[0]) snprintf(out, n, "%s %s", mfr, soc);
+    else if (soc[0]) snprintf(out, n, "%s", soc);
+    else if (__system_property_get("ro.board.platform", soc) > 0 && soc[0]) snprintf(out, n, "%s (ARM64)", soc);
+    else snprintf(out, n, "Android ARM64");
+#elif defined(__aarch64__)
+    snprintf(out, n, "ARM64");
 #endif
 }
 
 int sysinfo_log_folder(char *out, size_t n) {
     const char *log = rt_log_path();
     if (log) snprintf(out, n, "%s", log);
-    else if (!plat_stderr_path(out, n) && !plat_exe_path(out, n)) return 0;
+    else if (!plat_stderr_path(out, n)) return plat_data_dir(out, n);
     char *s = strrchr(out, '\\'), *f = strrchr(out, '/');
     if (f > s) s = f;
     if (!s) return 0;

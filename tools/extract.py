@@ -199,6 +199,8 @@ def main():
     parser.add_argument('--base', type=Path, help='base game (default: input.base of the config)')
     parser.add_argument('--update', type=Path, action='append',
                         help='an update NSP, repeatable (default: input.updates of the config)')
+    parser.add_argument('--dlc', type=Path, action='append',
+                        help='an add-on content (DLC) NSP, repeatable (default: input.dlcs of the config)')
     parser.add_argument('--keys', type=Path, help='prod.keys (default: input.keys of the config)')
     parser.add_argument('--work', type=Path, help='output directory with extracted/ and logs/ (default: work.dir of '
                                                   'the config, else build)')
@@ -215,12 +217,14 @@ def main():
     given = config.get('input', {})
     base, keys = args.base or Path(given['base']), args.keys or Path(given['keys'])
     updates = args.update or given.get('updates', [])
+    raw_dlcs = args.dlc or given.get('dlcs', [])
+    dlcs = [f for item in raw_dlcs for f in (sorted(Path(item).glob('*.nsp')) if Path(item).is_dir() else [Path(item)])]
     work = args.work or ROOT / config.get('work', {}).get('dir', 'build')
     extracted, logs = work / 'extracted', work / 'logs'
     logs.mkdir(parents=True, exist_ok=True)
     if args.record:
         require(len(updates) == 1, '--record takes one update')
-        record(region, args.record, base, Path(updates[0]), keys, extracted, logs)
+        record(region, args.record, base, Path(updates[0]), dlcs, keys, extracted, logs)
         return
     versions = load_expected(region)
     require('1.0.0' in versions, f'No expected hashes for the {region.name} release in {shown(DATA)}; '
@@ -242,20 +246,39 @@ def main():
             extract_base_romfs(base_out, keys, logs, base)
         check_romfs(base_out / 'romfs', v0)
 
+    last_update_dir = None
     for update in updates:
-        extract_update(base, Path(update), keys, extracted, logs, versions, region)
+        last_update_dir = extract_update(base, Path(update), keys, extracted, logs, versions, region)
+    if dlcs:
+        target = last_update_dir or base_out
+        for dlc in dlcs:
+            extract_dlc(Path(dlc), keys, target, logs, region)
 
 
-def record(region, version, base, update, keys, extracted, logs):
+def record(region, version, base, update, dlcs, keys, extracted, logs):
     """Write tools/data's expected files of a release from its game files (main --record)."""
-    files = {v: DATA / region.expected_name(v) for v in ('1.0.0', version)}
-    require(not any(f.exists() for f in files.values()), f'{", ".join(f.name for f in files.values() if f.exists())} '
-                                                         'already exist; remove them to record again')
+    base_expected = DATA / region.expected_name('1.0.0')
+    upd_expected = DATA / region.expected_name(version)
+    require(not upd_expected.exists(), f'{upd_expected.name} already exists; remove it to record again')
     exefs_names = (*EXEFS_CODE, 'main.npdm')
     base_out, update_out = extracted / ('v0' + region.suffix), extracted / region.version_tag(version)
     say(f'Recording the {region.name} release: base game {base.name}, update {update.name} as {version}')
-    extract_exefs(base, keys, base_out, logs, update=False)
-    extract_exefs(update, keys, update_out, logs, update=True)
+    if base_expected.is_file():
+        v0 = json.loads(base_expected.read_text())
+        if exefs_problems(base_out / 'exefs', v0):
+            extract_exefs(base, keys, base_out, logs, update=False)
+        problems = exefs_problems(base_out / 'exefs', v0)
+        require(not problems, f'Base game is not XC2 1.0.0: {", ".join(problems)} differ')
+    else:
+        extract_exefs(base, keys, base_out, logs, update=False)
+    staging = extracted / 'update-staging'
+    if (staging / 'extraction-manifest.json').is_file() and \
+            json.loads((staging / 'extraction-manifest.json').read_text()).get('source') == str(update.resolve()):
+        if update_out.exists():
+            shutil.rmtree(update_out)
+        staging.rename(update_out)
+    else:
+        extract_exefs(update, keys, update_out, logs, update=True)
     for name, out in (('base game', base_out), ('update', update_out)):
         title = json.loads((out / 'extraction-manifest.json').read_text())['program']['title_id'].upper()
         require(xc2_titles.of_title(title) is region, f'The {name} is title {title}, not the {region.name} release '
@@ -276,9 +299,13 @@ def record(region, version, base, update, keys, extracted, logs):
                   'exefs_sha256': {n: sha256(update_out / 'exefs' / n) for n in sorted(exefs_names)},
                   'romfs': {'size': report['romfs_size'], 'sha256': report['romfs_sha256']}},
     }
-    for v, path in files.items():
-        path.write_text(json.dumps(entries[v], indent=2) + '\n', encoding='utf-8')
-        say(f'  wrote {shown(path)}')
+    if not base_expected.is_file():
+        base_expected.write_text(json.dumps(entries['1.0.0'], indent=2) + '\n', encoding='utf-8')
+        say(f'  wrote {shown(base_expected)}')
+    upd_expected.write_text(json.dumps(entries[version], indent=2) + '\n', encoding='utf-8')
+    say(f'  wrote {shown(upd_expected)}')
+    for dlc in dlcs:
+        extract_dlc(Path(dlc), keys, update_out, logs, region)
 
 
 def extract_update(base, update, keys, extracted, logs, versions, region=xc2_titles.DEFAULT):
@@ -305,6 +332,38 @@ def extract_update(base, update, keys, extracted, logs, versions, region=xc2_tit
         say('  merging RomFS with the update')
         merge_update_romfs(base, update, keys, current / 'romfs')
     check_romfs(current / 'romfs', expected)
+    return current
+
+
+def extract_dlc(dlc, keys, target_dir, logs, region=xc2_titles.DEFAULT):
+    from extract_exefs import container_entries, load_keys, nca_inventory
+    say(f'DLC {dlc.name}')
+    keyring = load_keys(Path(keys).resolve())
+    with dlc.open('rb') as f:
+        _, entries = container_entries(f, dlc.stat().st_size)
+        public = [r for r, _ in nca_inventory(f, entries, keyring) if r['content_type'] == 5]
+    del keyring
+    require(len(public) == 1, f'{dlc.name}: expected one PublicData NCA')
+    tid = public[0]['title_id'].upper()
+    index = region.aoc_index(tid)
+    require(index is not None, f'{dlc.name}: title {tid} is not an add-on of the {region.name} release')
+    out_dir = target_dir / 'aoc' / str(index)
+    idx_json = out_dir / 'index.json'
+    if idx_json.is_file() and json.loads(idx_json.read_text()).get('status') == 'pass':
+        say(f'  AOC #{index} ({tid}): already unpacked')
+        return
+    say(f'  unpacking AOC #{index} ({tid})')
+    part = target_dir / 'aoc' / f'.{index}.part'
+    if part.exists():
+        shutil.rmtree(part)
+    part.parent.mkdir(parents=True, exist_ok=True)
+    run_logged([sys.executable, ROOT / 'tools' / 'xc2_extract.py', 'dlc-romfs', dlc, '--keys', keys, '--output', part],
+               logs / f'extract_dlc-{index}.log', source=dlc)
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    part.rename(out_dir)
+    report = json.loads((out_dir / 'index.json').read_text())
+    say(f'  AOC #{index}: {len(report["files"]):,} files unpacked, hash matches')
 
 
 if __name__ == '__main__':

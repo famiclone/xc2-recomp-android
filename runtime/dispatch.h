@@ -25,7 +25,11 @@ typedef struct RtLayoutEntry { const char *name; uint64_t base, size; } RtLayout
 // What recomp/layout.py fixes for every game version: main loads first at FIRST_BASE, and ORDER names at most 12
 // modules (main, subsdk0..9, sdk). The runtime library uses these instead of layout.h, so it builds without the
 // generated C (the release's prebuilt libxc2rt.a); modules.c checks them against the layout at install.
+#ifdef __ANDROID__
+#define RT_MAIN_BASE 0x4000000000ull
+#else
 #define RT_MAIN_BASE 0x7000000000ull
+#endif
 #define RT_MODULES_MAX 12
 extern const RtLayoutEntry rt_layout[];
 extern const int rt_layout_count;

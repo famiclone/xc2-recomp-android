@@ -76,7 +76,8 @@ static void frame_limit_live(void);
 // +0x48 is the game limiter's wait, the frame time of the limit; the pacer shows frames at the limit. The guest reads
 // each word whole.
 static int xc2_rate = -2;
-static int xc2_game;   // the set is XC2's xc2fps (patches-v301.txt), not XCX's xcx60
+static int xc2_game;   // the set is XC2's xc2fps (patches-v210.txt, patches-v301.txt), not XCX's xcx60
+static int xc2_v210;   // XC2 2.1.0: main's .data begins at +0xb39000 (3.0.1: +0xb3a000)
 static _Atomic uint32_t *xc2_words;
 static int xc2_cut;   // a cutscene runs at 30 fps: the step stays 1/30 s
 
@@ -110,8 +111,9 @@ static void xc2_interval_store(int n) {
     static int stored = 1;
     if (n == stored) return;
     stored = n;
-    // XC2: the interval its boot setter main+0x6a4078 writes, main+0xb75c40 (recomp/patches-v301.txt, set xc2fps)
-    __atomic_store_n((uint32_t *)(uintptr_t)(RT_MAIN_BASE + (xc2_game ? 0xb75c40 : 0x1d943a0)), (uint32_t)n, __ATOMIC_RELEASE);
+    // XC2: the interval its boot setter writes, main+0xb75c40 in 3.0.1 and main+0xb74bf0 in 2.1.0 (set xc2fps)
+    uint64_t off = xc2_game ? (xc2_v210 ? 0xb74bf0 : 0xb75c40) : 0x1d943a0;
+    __atomic_store_n((uint32_t *)(uintptr_t)(RT_MAIN_BASE + off), (uint32_t)n, __ATOMIC_RELEASE);
     rt_log("frame rate: %s", n == 2 ? "cutscene, 30 fps (2 vsyncs of 1/60 s)" : "limit again");
 }
 
@@ -131,9 +133,9 @@ static int xc2_cutscene(void) {
     }
     if (!mode) return 0;
     if (movie_playing()) return 1;
-    if (xc2_game) {   // XC2: a byte at main+0xbd8f40, 1 while a cutscene plays (Xenoblade2DynFPS's 2.1.0 0xbd7f40, + 0x1000)
+    if (xc2_game) {   // XC2: a byte at main+0xbd8f40 in 3.0.1 and main+0xbd7f40 in 2.1.0, 1 while a cutscene plays
         uint8_t on = 0;
-        plat_mem_read(RT_MAIN_BASE + 0xbd8f40, &on, 1);
+        plat_mem_read(RT_MAIN_BASE + (xc2_v210 ? 0xbd7f40 : 0xbd8f40), &on, 1);
         static uint8_t was;
         if (on != was) rt_log("frame rate: cutscene %s", on ? "starts" : "ends"), was = on;
         return on != 0;
@@ -147,7 +149,10 @@ static int xc2_cutscene(void) {
 
 void frame_step_init(void) {
     xc2_rate = rt_patch_set("xcx60");
-    if (xc2_rate < 0 && (xc2_rate = rt_patch_set("xc2fps")) >= 0) xc2_game = 1;
+    if (xc2_rate < 0 && (xc2_rate = rt_patch_set("xc2fps")) >= 0) {
+        xc2_game = 1;
+        xc2_v210 = ldr_count() > 0 && ldr_module(0)->data_off == 0xb39000;
+    }
     if (rt_patch_enabled(xc2_rate)) {
         xc2_words = (_Atomic uint32_t *)((uint8_t *)rt_patch_page() + 0x40);
         xc2_rate_store(60, 60);
@@ -388,16 +393,16 @@ static void xc2_steps_store(double seconds) {
     atomic_store_explicit(&xc2_words[10], kw, memory_order_release);   // +0x68
     xc2_retention_store(kick);
     // A frame step the game reads once, at boot (main+0x328fb8 stores the frame-time getter main+0x6a36bc into
-    // main+0xea538c), and 14 places use every frame. It froze at the boot frame time (0.0235 s with a 120 fps limit)
-    // while the camera moved by the measured step, so props drawn with it slid against the terrain and flickered when
-    // the camera moved or shook; at 30 fps the two agreed.
-    __atomic_store_n((uint32_t *)(uintptr_t)(RT_MAIN_BASE + 0xea538c), b, __ATOMIC_RELAXED);
+    // main+0xea538c in 3.0.1; 2.1.0 main+0x328714 into main+0xea438c), and 14 places use every frame. It froze at the
+    // boot frame time (0.0235 s with a 120 fps limit) while the camera moved by the measured step, so props drawn with
+    // it slid against the terrain and flickered when the camera moved or shook; at 30 fps the two agreed.
+    __atomic_store_n((uint32_t *)(uintptr_t)(RT_MAIN_BASE + (xc2_v210 ? 0xea438c : 0xea538c)), b, __ATOMIC_RELAXED);
     uint64_t game = 0, ui = 0;
-    if (plat_mem_read(RT_MAIN_BASE + 0xb900d0, &game, 8) && game && plat_mem_readable(game + 0x78, 8)) {
+    if (plat_mem_read(RT_MAIN_BASE + (xc2_v210 ? 0xb8f0d0 : 0xb900d0), &game, 8) && game && plat_mem_readable(game + 0x78, 8)) {
         __atomic_store_n((uint32_t *)(uintptr_t)(game + 0x78), b, __ATOMIC_RELAXED);
         __atomic_store_n((uint32_t *)(uintptr_t)(game + 0x7c), b, __ATOMIC_RELAXED);
     }
-    if (plat_mem_read(RT_MAIN_BASE + 0xc232c8, &ui, 8) && ui && plat_mem_readable(ui + 0x80, 4))
+    if (plat_mem_read(RT_MAIN_BASE + (xc2_v210 ? 0xc222c8 : 0xc232c8), &ui, 8) && ui && plat_mem_readable(ui + 0x80, 4))
         __atomic_store_n((uint32_t *)(uintptr_t)(ui + 0x80), b, __ATOMIC_RELAXED);
 }
 

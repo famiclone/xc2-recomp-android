@@ -923,6 +923,15 @@ int plat_exe_path(char *out, size_t cap) {
     return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL) != 0;
 }
 
+int plat_data_dir(char *out, size_t cap) {
+    if (!plat_exe_path(out, cap)) return 0;
+    char *cut = plat_last_sep(out);
+    if (cut) *cut = 0;
+    else if (cap < 2) return 0;
+    else strcpy(out, ".");
+    return 1;
+}
+
 size_t plat_getenv(const char *name, char *out, size_t cap) {
     wchar_t wn[256], v[WPATH];
     if (!widen(name, wn, 256)) return 0;

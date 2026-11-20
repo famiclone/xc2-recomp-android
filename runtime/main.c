@@ -30,6 +30,11 @@
 #include <windows.h>
 #include <psapi.h>
 #endif
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <SDL3/SDL.h>
+#include "input_sdl.h"
+#endif
 #include "sha256.h"
 
 #define MAX_MODULES 16
@@ -54,6 +59,13 @@ static uint64_t g_log_bytes;
 
 void rt_log_raw(const char *p, size_t n) {
     fwrite(p, 1, n, stderr);
+#ifdef __ANDROID__
+    if (n) {
+        size_t trim = n;
+        while (trim && (p[trim - 1] == '\n' || p[trim - 1] == '\r')) trim--;
+        if (trim) __android_log_print(ANDROID_LOG_INFO, "XC2Recomp", "%.*s", (int)(trim < 1000 ? trim : 1000), p);
+    }
+#endif
     int state = __atomic_load_n(&g_log_state, __ATOMIC_ACQUIRE);
     if (state == LOG_EARLY) {
         size_t at = __atomic_fetch_add(&g_log_early_n, n, __ATOMIC_RELAXED);
@@ -101,15 +113,10 @@ const char *rt_log_path(void) {
 // Opens the log file for a game run (game = 1) and writes the buffered lines to it; anything else drops them. Runs on
 // the main thread before the boot starts other threads.
 static void log_open(int game) {
-    char dir[PLAT_PATH_MAX * 3], from[PLAT_PATH_MAX * 3 + 16], to[PLAT_PATH_MAX * 3 + 16];
-    char *cut = NULL;
-    if (game && !plat_stderr_path(dir, sizeof dir) && plat_exe_path(dir, sizeof dir)) {
-        cut = plat_last_sep(dir);
-        char *f = strrchr(dir, '/');
-        if (f > cut) cut = f;
-    }
-    if (cut && (size_t)(cut - dir) + sizeof "/logs" <= sizeof dir) {
-        strcpy(cut, "/logs");
+    char base[PLAT_PATH_MAX * 2], dir[PLAT_PATH_MAX * 3], from[PLAT_PATH_MAX * 3 + 16], to[PLAT_PATH_MAX * 3 + 16];
+    int have_dir = game && !plat_stderr_path(dir, sizeof dir) && plat_data_dir(base, sizeof base) &&
+                   snprintf(dir, sizeof dir, "%s/logs", base) < (int)sizeof dir;
+    if (have_dir) {
         plat_file_mkdir_p(dir);
         for (int i = LOG_KEEP - 1; i > 0; i--) {   // xc2.3.log -> xc2.4.log, ..., xc2.log -> xc2.1.log
             if (i > 1) snprintf(from, sizeof from, "%s/xc2.%d.log", dir, i - 1);
@@ -376,11 +383,30 @@ static double now_s(void) { return (double)plat_now_ns() / 1e9; }
 static volatile int host_probe_hits;
 static void host_probe(Cpu *c) { host_probe_hits++; c->x[0] = 42; }
 
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+#endif
+
 static void check_cpu(void) {
+#if defined(__x86_64__) || defined(_M_X64)
     __builtin_cpu_init();
     int ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2");
     printf("cpu: x86-64-v3 (AVX2, FMA, BMI2) %s\n", ok ? "present" : "MISSING");
     CHECK(ok, "the lifted code is built for x86-64-v3");
+#elif defined(__aarch64__)
+    int ok = 1;
+#if defined(__linux__) && defined(AT_HWCAP)
+    unsigned long hw = getauxval(AT_HWCAP);
+    // HWCAP_FP (1<<0), HWCAP_ASIMD (1<<1), HWCAP_ATOMICS (1<<8)
+    ok = (hw & ((1ul << 0) | (1ul << 1))) == ((1ul << 0) | (1ul << 1));
+    printf("cpu: arm64 (ASIMD=%d, LSE=%d, FP16=%d, DotProd=%d) %s\n",
+           !!(hw & (1ul << 1)), !!(hw & (1ul << 8)), !!(hw & (1ul << 9)), !!(hw & (1ul << 20)),
+           ok ? "present" : "MISSING");
+#else
+    printf("cpu: arm64 (NEON) present\n");
+#endif
+    CHECK(ok, "the lifted code requires ARM64 AdvSIMD (NEON)");
+#endif
 }
 
 // Layout: ascending, no overlap, below 2^39, and inside the window mem_init reserved.
@@ -579,20 +605,29 @@ static const char *portable_path(const char *dir, const char *var, const char *s
 // Resolve copied-folder defaults from xc2.exe's folder so shortcut working directories do not change them.
 static void portable_paths(RtConfig *c) {
     char exe[PLAT_PATH_MAX * 2];
-    int n = plat_exe_path(exe, sizeof exe);
-    char *cut = n && n < sizeof exe ? plat_last_sep(exe) : NULL;
-    if (!cut) return;
-    *cut = 0;
+    if (!plat_data_dir(exe, sizeof exe)) return;
     const char *profile_env = cfg_get("XC2_PROFILE_DIR");
     pp_profile_explicit = profile_env && *profile_env;
+#ifdef __ANDROID__
+    snprintf(pp_exefs, sizeof pp_exefs, "%s/exefs", exe);
+    snprintf(pp_romfs, sizeof pp_romfs, "%s/romfs", exe);
+    snprintf(pp_profile, sizeof pp_profile, "%s/profile", exe);
+    c->exefs = portable_path(exe, "XC2_EXEFS", "exefs", "main.npdm", 0, pp_exefs, sizeof pp_exefs, pp_exefs);
+    c->romfs = portable_path(exe, "XC2_ROMFS", "romfs", "romfs.bin", 0, pp_romfs, sizeof pp_romfs, pp_romfs);
+    c->profile = portable_path(exe, "XC2_PROFILE_DIR", "profile", NULL, 1, pp_profile, sizeof pp_profile, pp_profile);
+    plat_file_mkdir_p(c->profile);
+    pp_exefs_portable = 1;
+#else
     c->exefs = portable_path(exe, "XC2_EXEFS", "exefs", "main.npdm", 0, pp_exefs, sizeof pp_exefs, c->exefs);
     const char *exefs_env = cfg_get("XC2_EXEFS");
     pp_exefs_portable = !(exefs_env && *exefs_env) && c->exefs == pp_exefs;
     c->romfs = portable_path(exe, "XC2_ROMFS", "romfs", "romfs.bin", 0, pp_romfs, sizeof pp_romfs, c->romfs);
     c->profile = portable_path(exe, "XC2_PROFILE_DIR", "profile", NULL, 1, pp_profile, sizeof pp_profile, c->profile);
     if (!pp_profile_explicit && !pp_exefs_portable && c->profile == pp_profile) c->profile = rt_default_profile;
+#endif
 }
 
+#ifndef __ANDROID__
 // After the command line, migrate a baked profile only when the portable profile is empty.
 static void profile_fallback(RtConfig *c) {
     if (pp_profile_explicit || (c->profile != rt_default_profile && c->profile != pp_profile) || !*pp_profile) return;
@@ -610,8 +645,61 @@ static void profile_fallback(RtConfig *c) {
     rt_log("cfg: cannot use the profile folder %s: using %s", c->profile, pp_profile);
     c->profile = pp_profile;
 }
+#endif
 
-int main(int argc, char **argv) {
+static int run_mode(const char *mode, const char *replay_dir) {
+    if (!mode) {
+#ifdef __ANDROID__
+        char npdm[PLAT_PATH_MAX * 2 + 32];
+        snprintf(npdm, sizeof npdm, "%s/main.npdm", cfg.exefs);
+        if (!plat_file_exists(npdm)) {
+            int st = selftest();
+            char data_dir[PLAT_PATH_MAX] = "/sdcard/Android/data/com.xc2recomp.app/files";
+            plat_data_dir(data_dir, sizeof data_dir);
+            char msg[1024];
+            snprintf(msg, sizeof msg,
+                     "XC2 Recomp Android runtime selftest: %s.\n\n"
+                     "Game data not found at:\n%s/exefs/main.npdm\n\n"
+                     "Extract your Xenoblade Chronicles 2 NSP + Update 3.0.1 on PC and push xc2-data/ to:\n%s",
+                     st == 0 ? "PASSED" : "FAILED", data_dir, data_dir);
+            rt_log("android: %s", msg);
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "XC2 Recomp", msg, gfx_window_sdl());
+            return st;
+        }
+#else
+        profile_fallback(&cfg);
+#endif
+        cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
+        rt_boot();
+        return 0;
+    }
+    if (!strcmp(mode, "--selftest")) return selftest();
+    if (!strcmp(mode, "--probe-loader")) return probe_loader();
+    if (!strcmp(mode, "--probe-cfg")) return probe_cfg();
+    if (!strcmp(mode, "--probe-kernel")) return probe_kernel();
+    if (!strcmp(mode, "--probe-ipc")) return probe_ipc();
+    if (!strcmp(mode, "--probe-services")) return probe_services();
+    if (!strcmp(mode, "--probe-fs")) return probe_fs();
+    if (!strcmp(mode, "--probe-gfx-abi")) return probe_gfx_abi();
+    if (!strcmp(mode, "--probe-nvn")) return probe_nvn();
+    if (!strcmp(mode, "--probe-nvn-tex")) return probe_nvn_tex();
+    if (!strcmp(mode, "--probe-window")) return probe_window();
+    if (!strcmp(mode, "--probe-shader")) return probe_shader();
+    if (!strcmp(mode, "--probe-vkmem")) return probe_vkmem();
+    if (!strcmp(mode, "--probe-vkexec")) return probe_vkexec();
+    if (!strcmp(mode, "--probe-astc")) return probe_astc();
+    if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
+    if (!strcmp(mode, "--probe-fsr")) return probe_fsr();
+    if (!strcmp(mode, "--probe-movie")) return probe_movie();
+    if (!strcmp(mode, "--probe-mods")) return probe_mods();
+    if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
+    if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
+    if (!strcmp(mode, "--replay")) return replay_main(replay_dir);
+    if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
+    return 2;
+}
+
+static int xc2_cli_entry(int argc, char **argv, const char **out_mode, const char **out_replay) {
     mem_init();   // first: claim the guest address space before anything else can land there; reads xc2.ini
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -668,34 +756,105 @@ int main(int argc, char **argv) {
     if (cfg.shot && !cfg.seconds) return usage(argv[0]);
     if (cfg.seconds && mode) return usage(argv[0]);
     log_open(!mode);
-    if (!mode) {
-        profile_fallback(&cfg);
-        cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
-        rt_boot();
-        return 0;
-    }
-    if (!strcmp(mode, "--selftest")) return selftest();
-    if (!strcmp(mode, "--probe-loader")) return probe_loader();
-    if (!strcmp(mode, "--probe-cfg")) return probe_cfg();
-    if (!strcmp(mode, "--probe-kernel")) return probe_kernel();
-    if (!strcmp(mode, "--probe-ipc")) return probe_ipc();
-    if (!strcmp(mode, "--probe-services")) return probe_services();
-    if (!strcmp(mode, "--probe-fs")) return probe_fs();
-    if (!strcmp(mode, "--probe-gfx-abi")) return probe_gfx_abi();
-    if (!strcmp(mode, "--probe-nvn")) return probe_nvn();
-    if (!strcmp(mode, "--probe-nvn-tex")) return probe_nvn_tex();
-    if (!strcmp(mode, "--probe-window")) return probe_window();
-    if (!strcmp(mode, "--probe-shader")) return probe_shader();
-    if (!strcmp(mode, "--probe-vkmem")) return probe_vkmem();
-    if (!strcmp(mode, "--probe-vkexec")) return probe_vkexec();
-    if (!strcmp(mode, "--probe-astc")) return probe_astc();
-    if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
-    if (!strcmp(mode, "--probe-fsr")) return probe_fsr();
-    if (!strcmp(mode, "--probe-movie")) return probe_movie();
-    if (!strcmp(mode, "--probe-mods")) return probe_mods();
-    if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
-    if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
-    if (!strcmp(mode, "--replay")) return replay_main(replay_dir);
-    if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
-    return usage(argv[0]);
+    *out_mode = mode;
+    *out_replay = replay_dir;
+    return -1;
 }
+
+#ifdef __ANDROID__
+#define SDL_MAIN_USE_CALLBACKS 1
+#include <SDL3/SDL_main.h>
+#undef main
+
+typedef struct {
+    char mode[64];
+    char replay[PLAT_PATH_MAX];
+    int has_mode;
+} AndroidBootArgs;
+
+static AndroidBootArgs g_android_args;
+static PlatThread *g_android_thread;
+static volatile int32_t g_android_done;
+static volatile int32_t g_android_rc;
+
+static void android_boot_main(void *arg) {
+    const AndroidBootArgs *a = arg;
+    int rc = run_mode(a->has_mode ? a->mode : NULL, a->replay[0] ? a->replay : NULL);
+    __atomic_store_n(&g_android_rc, rc, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_android_done, 1, __ATOMIC_RELEASE);
+}
+
+SDL_AppResult SDLCALL SDL_AppInit(void **appstate, int argc, char *argv[]) {
+    (void)appstate;
+    char existing[PLAT_PATH_MAX];
+    if (!plat_getenv("XC2_DATA_DIR", existing, sizeof existing)) {
+        const char *ext = SDL_GetAndroidExternalStoragePath();
+        if (!ext || !*ext) ext = SDL_GetAndroidInternalStoragePath();
+        if (ext && *ext) {
+            plat_setenv("XC2_DATA_DIR", ext);
+            plat_file_mkdir_p(ext);
+        }
+    } else {
+        plat_file_mkdir_p(existing);
+    }
+    const char *mode = NULL, *replay_dir = NULL;
+    int prep = xc2_cli_entry(argc, argv, &mode, &replay_dir);
+    if (prep >= 0) return prep == 0 ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    if (!gfx_window_sdl_android_init()) {
+        rt_log("android: SDL video init failed");
+        return SDL_APP_FAILURE;
+    }
+    if (mode) {
+        snprintf(g_android_args.mode, sizeof g_android_args.mode, "%s", mode);
+        g_android_args.has_mode = 1;
+    }
+    if (replay_dir) snprintf(g_android_args.replay, sizeof g_android_args.replay, "%s", replay_dir);
+    g_android_thread = plat_thread_new_ex(android_boot_main, &g_android_args, "xc2 main", PLAT_STACK_DEFAULT);
+    if (!g_android_thread) {
+        rt_log("android: cannot start guest main thread");
+        return SDL_APP_FAILURE;
+    }
+    return SDL_APP_CONTINUE;
+}
+
+SDL_AppResult SDLCALL SDL_AppEvent(void *appstate, SDL_Event *event) {
+    (void)appstate;
+    gfx_window_sdl_android_event(event);
+    if (event && event->type == SDL_EVENT_QUIT && __atomic_load_n(&g_android_done, __ATOMIC_ACQUIRE))
+        return __atomic_load_n(&g_android_rc, __ATOMIC_ACQUIRE) == 0 ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    return SDL_APP_CONTINUE;
+}
+
+SDL_AppResult SDLCALL SDL_AppIterate(void *appstate) {
+    (void)appstate;
+    gfx_window_sdl_android_iterate();
+    if (__atomic_load_n(&g_android_done, __ATOMIC_ACQUIRE))
+        return __atomic_load_n(&g_android_rc, __ATOMIC_ACQUIRE) == 0 ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    SDL_Delay(4);
+    return SDL_APP_CONTINUE;
+}
+
+void SDLCALL SDL_AppQuit(void *appstate, SDL_AppResult result) {
+    (void)appstate, (void)result;
+    if (g_android_thread && __atomic_load_n(&g_android_done, __ATOMIC_ACQUIRE)) {
+        plat_thread_join(g_android_thread);
+        g_android_thread = NULL;
+    }
+}
+
+__attribute__((weak)) int main(int argc, char **argv) {
+    const char *mode = NULL, *replay_dir = NULL;
+    int prep = xc2_cli_entry(argc, argv, &mode, &replay_dir);
+    if (prep >= 0) return prep;
+    int rc = run_mode(mode, replay_dir);
+    return rc == 2 ? usage(argv[0]) : rc;
+}
+#else
+int main(int argc, char **argv) {
+    const char *mode = NULL, *replay_dir = NULL;
+    int prep = xc2_cli_entry(argc, argv, &mode, &replay_dir);
+    if (prep >= 0) return prep;
+    int rc = run_mode(mode, replay_dir);
+    return rc == 2 ? usage(argv[0]) : rc;
+}
+#endif

@@ -10,10 +10,10 @@
 // correctly rounded (build x86 with -mfma).
 #pragma once
 #include <fenv.h>
-#include <immintrin.h>
 #include <math.h>
 
 #include "cpu.h"
+#include "simd_platform.h"
 
 typedef __uint128_t u128;
 #define SI static inline __attribute__((always_inline))
@@ -211,6 +211,24 @@ SI int simd_fe_mode(uint64_t fpcr) {
     return m[(fpcr >> 22) & 3];
 }
 
+#if defined(__aarch64__)
+// ARM64 FPCR rounding mode (bits 23:22: RN 00, RP 01, RM 10, RZ 11) matches c->fpcr directly.
+#define SIMD_RC_MASK 0x00c00000u
+SI unsigned simd_fpcr_get(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return (unsigned)v; }
+SI void simd_fpcr_set(unsigned v) { __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)v) : "memory"); }
+SI unsigned simd_rm_set_rc(unsigned cur, unsigned rc) {
+    if ((cur & SIMD_RC_MASK) != rc) simd_fpcr_set((cur & ~SIMD_RC_MASK) | rc);
+    return cur;
+}
+SI unsigned simd_rm_enter(uint64_t fpcr) {
+    return simd_rm_set_rc(simd_fpcr_get(), (unsigned)fpcr & SIMD_RC_MASK);
+}
+SI void simd_rm_rz(void) { simd_rm_set_rc(simd_fpcr_get(), SIMD_RC_MASK); }
+SI void simd_rm_leave(unsigned old) {
+    unsigned cur = simd_fpcr_get();
+    if ((cur & SIMD_RC_MASK) != (old & SIMD_RC_MASK)) simd_fpcr_set((cur & ~SIMD_RC_MASK) | (old & SIMD_RC_MASK));
+}
+#else
 // MXCSR rounding control (bits 13-14) without fesetround's x87 + SSE double write; ldmxcsr only on change.
 #define SIMD_RC_MASK 0x6000u
 SI unsigned simd_rm_set_rc(unsigned cur, unsigned rc) {
@@ -229,10 +247,70 @@ SI void simd_rm_leave(unsigned old) {
     unsigned cur = _mm_getcsr();
     if ((cur & SIMD_RC_MASK) != (old & SIMD_RC_MASK)) _mm_setcsr((cur & ~SIMD_RC_MASK) | (old & SIMD_RC_MASK));
 }
+#endif
 
 // The thread's MXCSR mirrors the guest FPCR.FZ with RC = nearest whenever guest code runs (cpu.h rt_fpcr_sync), so
 // plain host FP gives the ARM result unless FPCR.RMode asks for directed rounding, which the slow paths handle.
 SI int simd_directed(const Cpu *c) { return __builtin_expect((c->fpcr & FPCR_RM) != 0, 0); }
+
+// Clang < 19 (Android NDK r26/r27) lacks __builtin_elementwise_{sqrt,fma,rint,round}; lower directly to native
+// AArch64 scalar/NEON instructions when unavailable while keeping __builtin_elementwise_* on Clang 19+ and x86-64.
+#if __has_builtin(__builtin_elementwise_sqrt)
+#define fsqrt_s(x) __builtin_elementwise_sqrt(x)
+#define fsqrt_d(x) __builtin_elementwise_sqrt(x)
+#define vfsqrt_s(x) __builtin_elementwise_sqrt(x)
+#define vfsqrt_d(x) __builtin_elementwise_sqrt(x)
+#elif defined(__aarch64__)
+SI float fsqrt_s(float x) { float r; __asm__("fsqrt %s0, %s1" : "=w"(r) : "w"(x)); return r; }
+SI double fsqrt_d(double x) { double r; __asm__("fsqrt %d0, %d1" : "=w"(r) : "w"(x)); return r; }
+SI vf32 vfsqrt_s(vf32 x) { return (vf32)vsqrtq_f32((float32x4_t)x); }
+SI vf64 vfsqrt_d(vf64 x) { return (vf64)vsqrtq_f64((float64x2_t)x); }
+#else
+SI float fsqrt_s(float x) { return x < 0.0f ? __builtin_nanf("") : __builtin_sqrtf(x); }
+SI double fsqrt_d(double x) { return x < 0.0 ? __builtin_nan("") : __builtin_sqrt(x); }
+SI vf32 vfsqrt_s(vf32 x) { vf32 r; for (int i = 0; i < 4; i++) r[i] = fsqrt_s(x[i]); return r; }
+SI vf64 vfsqrt_d(vf64 x) { vf64 r; for (int i = 0; i < 2; i++) r[i] = fsqrt_d(x[i]); return r; }
+#endif
+
+#if __has_builtin(__builtin_elementwise_fma)
+#define ffma_s(x, y, z) __builtin_elementwise_fma(x, y, z)
+#define ffma_d(x, y, z) __builtin_elementwise_fma(x, y, z)
+#define vffma_s(x, y, z) __builtin_elementwise_fma(x, y, z)
+#define vffma_d(x, y, z) __builtin_elementwise_fma(x, y, z)
+#elif defined(__aarch64__)
+#define ffma_s(x, y, z) __builtin_fmaf(x, y, z)
+#define ffma_d(x, y, z) __builtin_fma(x, y, z)
+SI vf32 vffma_s(vf32 x, vf32 y, vf32 z) { return (vf32)vfmaq_f32((float32x4_t)z, (float32x4_t)x, (float32x4_t)y); }
+SI vf64 vffma_d(vf64 x, vf64 y, vf64 z) { return (vf64)vfmaq_f64((float64x2_t)z, (float64x2_t)x, (float64x2_t)y); }
+#else
+#define ffma_s(x, y, z) __builtin_fmaf(x, y, z)
+#define ffma_d(x, y, z) __builtin_fma(x, y, z)
+SI vf32 vffma_s(vf32 x, vf32 y, vf32 z) { vf32 r; for (int i = 0; i < 4; i++) r[i] = __builtin_fmaf(x[i], y[i], z[i]); return r; }
+SI vf64 vffma_d(vf64 x, vf64 y, vf64 z) { vf64 r; for (int i = 0; i < 2; i++) r[i] = __builtin_fma(x[i], y[i], z[i]); return r; }
+#endif
+
+#if __has_builtin(__builtin_elementwise_rint)
+#define SIMD_RINT(x) __builtin_elementwise_rint(x)
+#else
+#define SIMD_RINT(x) __builtin_elementwise_roundeven(x)
+#endif
+
+#if __has_builtin(__builtin_elementwise_round)
+#define frnda_s(x) __builtin_elementwise_round(x)
+#define frnda_d(x) __builtin_elementwise_round(x)
+#define vfrnda_s(x) __builtin_elementwise_round(x)
+#define vfrnda_d(x) __builtin_elementwise_round(x)
+#elif defined(__aarch64__)
+#define frnda_s(x) __builtin_roundf(x)
+#define frnda_d(x) __builtin_round(x)
+SI vf32 vfrnda_s(vf32 x) { return (vf32)vrndaq_f32((float32x4_t)x); }
+SI vf64 vfrnda_d(vf64 x) { return (vf64)vrndaq_f64((float64x2_t)x); }
+#else
+#define frnda_s(x) __builtin_roundf(x)
+#define frnda_d(x) __builtin_round(x)
+SI vf32 vfrnda_s(vf32 x) { vf32 r; for (int i = 0; i < 4; i++) r[i] = __builtin_roundf(x[i]); return r; }
+SI vf64 vfrnda_d(vf64 x) { vf64 r; for (int i = 0; i < 2; i++) r[i] = __builtin_round(x[i]); return r; }
+#endif
 
 #define F s
 #define T float
@@ -595,8 +673,12 @@ SI void sl_across(Cpu *c, int op, int u, int Q, int sz, int d, int n) {
 }
 // PMULL2/PMULL 1Q (64x64 -> 128 carry-less)
 SI void sl_pmull64(Cpu *c, int part, int d, int n, int m) {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+    c->v[d] = (u128)vmull_p64((poly64_t)((sa64 *)&c->v[n])[part], (poly64_t)((sa64 *)&c->v[m])[part]);
+#else
     uint64_t hi, lo = pmul64(((sa64 *)&c->v[n])[part], ((sa64 *)&c->v[m])[part], &hi);
     c->v[d] = ((u128)hi << 64) | lo;
+#endif
 }
 
 // ---- FP vector helpers: lanes of the 64-bit form are computed on a zero upper half
@@ -673,6 +755,25 @@ SI void sv_fcvtn(Cpu *c, int sz, int part, int odd, int d, int n) {
 
 // TBL / TBX with len+1 table registers
 SI void sv_tbl(Cpu *c, int Q, int len, int tbx, int d, int n, int m) {
+#if defined(__aarch64__)
+    uint8x16_t idx = vld1q_u8((const uint8_t *)&c->v[m]), out;
+    if (len == 0) {
+        uint8x16_t t0 = vld1q_u8((const uint8_t *)&c->v[n]);
+        out = tbx ? vqtbx1q_u8(vld1q_u8((const uint8_t *)&c->v[d]), t0, idx) : vqtbl1q_u8(t0, idx);
+    } else if (len == 1) {
+        uint8x16x2_t t = {{vld1q_u8((const uint8_t *)&c->v[n]), vld1q_u8((const uint8_t *)&c->v[(n + 1) & 31])}};
+        out = tbx ? vqtbx2q_u8(vld1q_u8((const uint8_t *)&c->v[d]), t, idx) : vqtbl2q_u8(t, idx);
+    } else if (len == 2) {
+        uint8x16x3_t t = {{vld1q_u8((const uint8_t *)&c->v[n]), vld1q_u8((const uint8_t *)&c->v[(n + 1) & 31]),
+                           vld1q_u8((const uint8_t *)&c->v[(n + 2) & 31])}};
+        out = tbx ? vqtbx3q_u8(vld1q_u8((const uint8_t *)&c->v[d]), t, idx) : vqtbl3q_u8(t, idx);
+    } else {
+        uint8x16x4_t t = {{vld1q_u8((const uint8_t *)&c->v[n]), vld1q_u8((const uint8_t *)&c->v[(n + 1) & 31]),
+                           vld1q_u8((const uint8_t *)&c->v[(n + 2) & 31]), vld1q_u8((const uint8_t *)&c->v[(n + 3) & 31])}};
+        out = tbx ? vqtbx4q_u8(vld1q_u8((const uint8_t *)&c->v[d]), t, idx) : vqtbl4q_u8(t, idx);
+    }
+    VW(uint8x16_t, Q, d, out);
+#else
     uint8_t tab[64];
     for (int i = 0; i <= len; i++) memcpy(tab + 16 * i, &c->v[(n + i) & 31], 16);
     u128 idx = c->v[m], o = c->v[d], r = 0;
@@ -681,15 +782,29 @@ SI void sv_tbl(Cpu *c, int Q, int len, int tbx, int d, int n, int m) {
         lset(&r, 0, i, k < 16u * (len + 1) ? tab[k] : tbx ? lget(&o, 0, i) : 0);
     }
     c->v[d] = r;
+#endif
 }
 
 // ---- CRC32 / CRC32C (bytes = 1, 2, 4, 8)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+SI uint32_t simd_crc32_hw(uint32_t acc, uint64_t v, int bytes) {
+    return bytes == 1 ? __builtin_arm_crc32b(acc, (uint8_t)v) : bytes == 2 ? __builtin_arm_crc32h(acc, (uint16_t)v)
+         : bytes == 4 ? __builtin_arm_crc32w(acc, (uint32_t)v) : __builtin_arm_crc32d(acc, v);
+}
+SI uint32_t simd_crc32c_hw(uint32_t acc, uint64_t v, int bytes) {
+    return bytes == 1 ? __builtin_arm_crc32cb(acc, (uint8_t)v) : bytes == 2 ? __builtin_arm_crc32ch(acc, (uint16_t)v)
+         : bytes == 4 ? __builtin_arm_crc32cw(acc, (uint32_t)v) : __builtin_arm_crc32cd(acc, v);
+}
+#define CRC32(acc, v, n) simd_crc32_hw((uint32_t)(acc), (v), n)
+#define CRC32C(acc, v, n) simd_crc32c_hw((uint32_t)(acc), (v), n)
+#else
 SI uint32_t simd_crc(const uint32_t *t, uint32_t acc, uint64_t v, int bytes) {
     for (int i = 0; i < bytes; i++) acc = t[(acc ^ (uint8_t)(v >> (8 * i))) & 0xff] ^ (acc >> 8);
     return acc;
 }
 #define CRC32(acc, v, n) simd_crc(simd_crc32_tab, (uint32_t)(acc), (v), n)
 #define CRC32C(acc, v, n) simd_crc(simd_crc32c_tab, (uint32_t)(acc), (v), n)
+#endif
 
 // ---- crypto (AES, SHA1, SHA256)
 SI uint8_t aes_xt(uint8_t x) { return (uint8_t)((x << 1) ^ ((x >> 7) * 0x1b)); }
@@ -698,6 +813,12 @@ SI uint8_t aes_mul(uint8_t x, int k) { // k in {9, 11, 13, 14}
     return (uint8_t)(x8 ^ (k & 4 ? x4 : 0) ^ (k & 2 ? x2 : 0) ^ (k & 1 ? x : 0));
 }
 SI void sv_aes(Cpu *c, int op, int d, int n) { // 0 AESE, 1 AESD, 2 AESMC, 3 AESIMC
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+    uint8x16_t vd = vld1q_u8((const uint8_t *)&c->v[d]), vn = vld1q_u8((const uint8_t *)&c->v[n]);
+    uint8x16_t r = op == 0 ? vaeseq_u8(vd, vn) : op == 1 ? vaesdq_u8(vd, vn)
+                 : op == 2 ? vaesmcq_u8(vn) : vaesimcq_u8(vn);
+    vst1q_u8((uint8_t *)&c->v[d], r);
+#else
     uint8_t s[16], r[16];
     u128 v = op < 2 ? c->v[d] ^ c->v[n] : c->v[n];
     memcpy(s, &v, 16);
@@ -717,6 +838,7 @@ SI void sv_aes(Cpu *c, int op, int d, int n) { // 0 AESE, 1 AESD, 2 AESMC, 3 AES
     }
     memcpy(&v, r, 16);
     c->v[d] = v;
+#endif
 }
 SI uint32_t rol32_(uint32_t x, int s) { return (x << s) | (x >> (32 - s)); }
 SI uint32_t ror32_(uint32_t x, int s) { return (x >> s) | (x << (32 - s)); }

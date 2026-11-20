@@ -16,7 +16,15 @@
 // overlay functions by the present path under its lock. ImGui itself runs on the present path only.
 #pragma once
 #include <stdint.h>
+#ifdef __ANDROID__
+#ifndef VK_NO_PROTOTYPES
+#define VK_NO_PROTOTYPES
+#endif
+#endif
 #include <vulkan/vulkan.h>
+#ifdef __ANDROID__
+#include "vk_loader.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {

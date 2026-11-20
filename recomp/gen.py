@@ -636,14 +636,21 @@ def main():
     ap.add_argument('--patches', type=Path, help='code patch table (recomp/patches.py)')
     ap.add_argument('--reg-locals', type=int, default=regs.LOCALS,
                     help=f'guest registers per function kept in C locals (recomp/regs.py; default {regs.LOCALS}, 0: none)')
+    ap.add_argument('--target', choices=('desktop', 'android-arm64'), default='desktop',
+                    help='target platform address layout and default host architecture (recomp/layout.py)')
+    ap.add_argument('--arch', choices=('x86_64', 'arm64'), default=None,
+                    help='target host architecture (C output is portable across both; arm64 activates native '
+                         '<arm_neon.h> / <arm_acle.h> helpers in runtime/simd.h when built with an AArch64 compiler)')
     ap.add_argument('--no-callee-saved-trust', action='store_true',
                     help='reload X19-X29 and SP after every call too, instead of trusting AAPCS64 (slower; for '
                          'telling a broken callee from a generator bug)')
     args = ap.parse_args()
+    if args.arch is None:
+        args.arch = 'arm64' if args.target == 'android-arm64' else 'x86_64'
     opts = {'reg_locals': args.reg_locals, 'callee_saved': not args.no_callee_saved_trust}
 
     t0 = time.perf_counter()
-    mods = layout(args.exefs)
+    mods = layout(args.exefs, target=args.target)
     write_layout(mods, args.out)
     table = patches.load(args.patches, mods) if args.patches else patches.Table()
     write_if_changed(args.out / 'patches.h', patches.header_text(table, GENERATED_MARKER))

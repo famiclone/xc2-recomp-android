@@ -69,11 +69,9 @@ static uint32_t fnv(const char *s, size_t n) {
 
 // The folder of the executable, with a trailing separator.
 static int exe_dir(char *out, size_t n) {
-    if (!plat_exe_path(out, n)) return 0;
-    char *cut = plat_last_sep(out);
-    if (!cut) return 0;
-    cut[1] = 0;
-    return 1;
+    char dir[PLAT_PATH_MAX];
+    if (!plat_data_dir(dir, sizeof dir)) return 0;
+    return snprintf(out, n, "%s/", dir) < (int)n;
 }
 
 static int build_id(char out[17]) {

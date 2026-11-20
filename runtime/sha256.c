@@ -7,6 +7,11 @@
 
 #if defined(__x86_64__)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#endif
 #endif
 
 static const uint32_t K[64] = {
@@ -73,6 +78,25 @@ __attribute__((target("sha,sse4.1"))) static void blocks_ni(uint32_t h[8], const
     _mm_storeu_si128((__m128i *)&h[0], _mm_blend_epi16(t, s1, 0xf0));   // DCBA
     _mm_storeu_si128((__m128i *)&h[4], _mm_alignr_epi8(s1, t, 8));      // HGFE
 }
+#elif defined(__aarch64__)
+__attribute__((target("sha2"))) static void blocks_arm(uint32_t h[8], const uint8_t *p, size_t n) {
+    uint32x4_t s0 = vld1q_u32(&h[0]), s1 = vld1q_u32(&h[4]);
+    for (; n; n--, p += 64) {
+        uint32x4_t a0 = s0, e0 = s1, m[4];
+        for (int g = 0; g < 16; g++) {
+            uint32x4_t *w = &m[g & 3];
+            if (g < 4) *w = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p + 16 * g)));
+            else *w = vsha256su1q_u32(vsha256su0q_u32(*w, m[(g + 1) & 3]), m[(g + 2) & 3], m[(g + 3) & 3]);
+            uint32x4_t wk = vaddq_u32(*w, vld1q_u32(&K[4 * g])), t = s0;
+            s0 = vsha256hq_u32(s0, s1, wk);
+            s1 = vsha256h2q_u32(s1, t, wk);
+        }
+        s0 = vaddq_u32(s0, a0);
+        s1 = vaddq_u32(s1, e0);
+    }
+    vst1q_u32(&h[0], s0);
+    vst1q_u32(&h[4], s1);
+}
 #endif
 
 static void blocks(uint32_t h[8], const uint8_t *p, size_t n) {
@@ -80,6 +104,18 @@ static void blocks(uint32_t h[8], const uint8_t *p, size_t n) {
     static int ni = -1;
     if (ni < 0) ni = __builtin_cpu_supports("sha") && __builtin_cpu_supports("sse4.1");
     if (ni) return blocks_ni(h, p, n);
+#elif defined(__aarch64__)
+    static int ni = -1;
+    if (ni < 0) {
+#if defined(__ARM_FEATURE_SHA2)
+        ni = 1;
+#elif defined(__linux__) && defined(AT_HWCAP)
+        ni = (getauxval(AT_HWCAP) & (1ul << 6)) != 0;   // HWCAP_SHA2
+#else
+        ni = 0;
+#endif
+    }
+    if (ni) return blocks_arm(h, p, n);
 #endif
     blocks_c(h, p, n);
 }

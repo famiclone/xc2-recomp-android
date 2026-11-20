@@ -92,7 +92,15 @@ EXE = 'xc2.exe' if WIN else 'xc2'
 def on_path(name):
     """name on PATH, else a path that does not exist (the tool check below names it)."""
     found = shutil.which(name)
-    return Path(found) if found else Path('/usr/bin') / name
+    if found:
+        return Path(found)
+    for prefix in (Path('/opt/homebrew/bin'), Path('/usr/local/bin')):
+        if (prefix / name).is_file():
+            return prefix / name
+    for cand in sorted(Path('/opt/homebrew/share/android-commandlinetools/cmake').glob(f'*/bin/{name}'), reverse=True):
+        if cand.is_file():
+            return cand
+    return Path('/usr/bin') / name
 
 
 CLANG = UCRT / 'clang.exe' if WIN else on_path('clang')
@@ -155,14 +163,14 @@ WINDRES = UCRT / 'windres.exe'   # runtime/xc2.rc: the manifest of xc2.exe
 TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
 DEPS = None            # the deps directory of an llvm-mingw build
 # tools/data/expected-<display version>.json for each build version name.
-DISPLAY_VERSIONS = {'v0': '1.0.0', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3', 'v301': '3.0.1',
+DISPLAY_VERSIONS = {'v0': '1.0.0', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3', 'v210': '2.1.0', 'v301': '3.0.1',
                     'v300jp': '3.0.0'}   # the Japanese release (tools/xc2_titles.py): expected-xc2-jp-3.0.0.json
 # rt_game_version is TotK's 121/143 discriminator (host.h RT_V143 switches 1.4.3-only offsets and ABI details on).
-# XCX 2.0.0 (upd) and XC2 3.0.1 keep 0: those branches must stay off for a different game.
+# XCX 2.0.0 (upd) and XC2 2.1.0/3.0.1 keep 0: those branches must stay off for a different game.
 GAME_VERSIONS = {'v0': 100, 'v112': 112, 'v121': 121, 'v143': 143}
 # The game version the menu shows. A named game prints this instead of rt_game_version.
-GAME_NAMES = {**DISPLAY_VERSIONS, 'upd': '2.0.0', 'v301': 'Xenoblade Chronicles 2 3.0.1',
-              'v300jp': 'Xenoblade Chronicles 2 3.0.0 (Japan)'}
+GAME_NAMES = {**DISPLAY_VERSIONS, 'upd': '2.0.0', 'v210': 'Xenoblade Chronicles 2 2.1.0',
+              'v301': 'Xenoblade Chronicles 2 3.0.1', 'v300jp': 'Xenoblade Chronicles 2 3.0.0 (Japan)'}
 
 GiB = 1 << 30
 # Peak commit of one compile, 1.2.1 at -O1 (2026-10-20): 120-180 MiB per ~3 MiB chunk, 568 MiB for main_table.c
@@ -270,13 +278,39 @@ def c_string(s):
 
 
 RUNTIME = ROOT / 'runtime'   # --runtime: a copy of runtime/ lets a task build without touching the shared tree
+ANDROID_TARGET = False       # set by main() for --target android-arm64
+
+
+def find_android_ndk_bin(override=None):
+    """Locate Android NDK LLVM prebuilt bin/ holding aarch64-linux-android29-clang(.cmd)."""
+    suffix = '.cmd' if WIN else ''
+    if override:
+        p = Path(override).resolve()
+        for cand in [p, p / 'bin'] + sorted(p.glob('toolchains/llvm/prebuilt/*/bin'), reverse=True):
+            if (cand / f'aarch64-linux-android29-clang{suffix}').is_file():
+                return cand
+    roots = []
+    for var in ('ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT', 'NDK_HOME'):
+        if os.environ.get(var):
+            roots.append(Path(os.environ[var]))
+    for pat in ('/opt/homebrew/share/android-commandlinetools/ndk/*',
+                '/opt/homebrew/share/android-sdk/ndk/*',
+                '/opt/homebrew/Caskroom/android-ndk/*/*/Contents/NDK',
+                os.path.expanduser('~/Library/Android/sdk/ndk/*'),
+                os.path.expanduser('~/Android/Sdk/ndk/*')):
+        roots.extend(sorted((Path(p) for p in __import__('glob').glob(pat)), reverse=True))
+    for r in roots:
+        for cand in sorted(r.glob('toolchains/llvm/prebuilt/*/bin'), reverse=True):
+            if (cand / f'aarch64-linux-android29-clang{suffix}').is_file():
+                return cand
+    return None
 
 
 def other_os(name):
     """A runtime file for another OS: Win32 ones (*_win.*, platform/win32.c, xc2.rc) off Windows, the SDL window's
     (*_sdl.*) and platform/linux.c on Windows."""
     stem = name.rsplit('.', 1)[0]
-    if WIN:
+    if WIN and not ANDROID_TARGET:
         return stem.endswith('_sdl') or name == 'linux.c'
     return stem.endswith('_win') or name in ('win32.c', 'xc2.rc')
 
@@ -345,17 +379,25 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     except INSTALL_SIDE. make_lib: build only that library, from the runtime objects except INSTALL_SIDE."""
     # No generated headers for the library: one of them slipping back into the runtime then fails here, not in CI
     inc = f'-I {cmd_path(RUNTIME)}' + ('' if make_lib else f' -I {cmd_path(gen)}')
-    vma = f'{cmd_path(DEPS / "include")} -I {cmd_path(DEPS / "include" / "vma")}' if DEPS else cmd_path(vma_include())
+    if DEPS:
+        vma_dir = DEPS / 'include' / 'vma' if (DEPS / 'include' / 'vma' / 'vk_mem_alloc.h').is_file() else vma_include()
+        vma = f'{cmd_path(DEPS / "include")} -I {cmd_path(vma_dir)}'
+    else:
+        vma = cmd_path(vma_include())
     imgui = cmd_path(RUNTIME / 'third_party' / 'imgui')
     rt_inc = f'{inc} -I {cmd_path(out)} -I {vma} -I {imgui}'   # romfs_config.h, vk_mem_alloc.h (+ deps headers), imgui.h
-    libs = [f'-L {cmd_path(DEPS / "lib")}'] + (LLVM_LINK_LIBS if WIN else LINK_LIBS) if DEPS else LINK_LIBS
+    libs = [f'-L {cmd_path(DEPS / "lib")}'] + (LLVM_LINK_LIBS if (WIN and not ANDROID_TARGET) else LINK_LIBS) if DEPS else LINK_LIBS
+    cxx_bin = CLANG.with_name(CLANG.name.replace('clang', 'clang++')) if ANDROID_TARGET else CLANG
+    cxx_flags = '-std=c++20 -fno-exceptions -fno-rtti' if ANDROID_TARGET else '-std=gnu++20 -fno-exceptions -fno-rtti'
     lines = [
         '# Written by tools/build_game.py; do not edit.',
         'ninja_required_version = 1.10',
         f'builddir = {ninja_path(out)}',
         f'cc = {cmd_arg(CLANG.as_posix())}',
+        f'cxx = {cmd_arg(cxx_bin.as_posix())}',
         f'genflags = {" ".join(GEN_FLAGS)} {inc}',
         f'rtflags = {" ".join(RT_FLAGS)} {rt_inc}',
+        f'cxxflags = {cxx_flags} {" ".join(RT_FLAGS)} {rt_inc}',
         f'ldflags = {" ".join(LINK_FLAGS)}',
         f'libs = {" ".join(libs)}',
         '',
@@ -374,12 +416,18 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         '  depfile = $out.d',
         '  description = CC $in',
         '',
+        'rule cxx_rt',
+        '  command = $cxx -x c++ $cxxflags -MD -MF $out.d -c $in -o $out',
+        '  deps = gcc',
+        '  depfile = $out.d',
+        '  description = CXX $in',
+        '',
         'rule rc',
         f'  command = {cmd_arg(WINDRES.as_posix())} -I {cmd_path(RUNTIME)} -O coff $in -o $out',
         '  description = RC $in',
         '',
         'rule link',
-        '  command = $cc $ldflags @$out.rsp $libs -o $out',
+        '  command = $cxx $ldflags @$out.rsp $libs -o $out',
         '  rspfile = $out.rsp',
         '  rspfile_content = $in_newline',
         '  description = LINK $out',
@@ -407,6 +455,8 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         if src.suffix == '.rc':   # windres writes no depfile: the files xc2.rc embeds are listed by hand
             lines.append(f'build {ninja_path(o)}: rc {ninja_path(src)} | {ninja_path(RUNTIME / "xc2.manifest")} '
                          f'{ninja_path(RUNTIME / "xc2.ico")}')
+        elif src.suffix == '.cpp':
+            lines.append(f'build {ninja_path(o)}: cxx_rt {ninja_path(src)}')
         else:
             lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}')
         rt.append(o)
@@ -998,15 +1048,24 @@ def main():
                     help='expected hashes (default tools/data/expected-<display version>.json)')
     ap.add_argument('--allow-stale-translator', action='store_true',
                     help='build although build/xlate does not match the sources (shaders may silently lose features)')
+    ap.add_argument('--target', choices=('desktop', 'android-arm64'), default='desktop',
+                    help='target platform (desktop or android-arm64 via Android NDK)')
     args = ap.parse_args()
 
-    gen = (args.gen or ROOT / 'generated' / args.version).resolve()
-    out = (args.out or ROOT / 'build' / args.version).resolve()
+    global CLANG, AR, WINDRES, NINJA, TOOLCHAIN_BIN, DEPS, EXE, GEN_FLAGS, RT_FLAGS, LINK_FLAGS, LINK_LIBS, ANDROID_TARGET
+    ANDROID_TARGET = args.target == 'android-arm64'
+    default_ver_dir = f'{args.version}-android' if ANDROID_TARGET else args.version
+    gen = (args.gen or ROOT / 'generated' / default_ver_dir).resolve()
+    out = (args.out or ROOT / 'build' / default_ver_dir).resolve()
     extracted = ROOT / 'build' / 'extracted' / args.version
-    paths = {'exefs': (args.exefs or extracted / 'exefs').resolve(),
-             'romfs': (args.romfs or extracted / 'romfs').resolve(),
-             'profile': (args.profile or ROOT / 'build' / ('profile' if args.version == 'v121'
-                                                           else f'profile-{args.version}')).resolve()}
+    host_romfs = (args.romfs or extracted / 'romfs').resolve()
+    if ANDROID_TARGET:
+        paths = {'exefs': Path('exefs'), 'romfs': Path('romfs'), 'profile': Path('profile')}
+    else:
+        paths = {'exefs': (args.exefs or extracted / 'exefs').resolve(),
+                 'romfs': host_romfs,
+                 'profile': (args.profile or ROOT / 'build' / ('profile' if args.version == 'v121'
+                                                               else f'profile-{args.version}')).resolve()}
     expected = args.expected
     if not expected:
         if args.version not in DISPLAY_VERSIONS:
@@ -1022,22 +1081,40 @@ def main():
     game_name = None if args.version in GAME_NAMES or not region else \
         f'Xenoblade Chronicles 2 {expected_json.get("display_version", "")}' + ('' if region is xc2_titles.DEFAULT
                                                                                else f' ({region.name})')
-    global CLANG, AR, WINDRES, NINJA, TOOLCHAIN_BIN, DEPS
     if args.ninja:
         NINJA = args.ninja.resolve()
     elif not NINJA.is_file() and (ROOT / 'bin' / ('ninja' + ('.exe' if WIN else ''))).is_file():
         NINJA = ROOT / 'bin' / ('ninja' + ('.exe' if WIN else ''))   # the release folder (tools/make_release.py)
-    dlls = SDL3_DLLS
+    dlls = [] if ANDROID_TARGET else SDL3_DLLS
     suffix = '.exe' if WIN else ''
-    if args.toolchain:
+    if ANDROID_TARGET:
+        ndk_bin = find_android_ndk_bin(args.toolchain)
+        if not ndk_bin:
+            sys.exit('Android NDK not found: set ANDROID_NDK_HOME or pass --toolchain <NDK>')
+        TOOLCHAIN_BIN = ndk_bin
+        CLANG = ndk_bin / ('aarch64-linux-android29-clang.cmd' if WIN else 'aarch64-linux-android29-clang')
+        AR = ndk_bin / f'llvm-ar{suffix}'
+        EXE = 'libmain.so'
+        GEN_FLAGS = ['-O1', '-fPIC', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label',
+                     '-fvisibility=hidden', '-march=armv8.2-a+fp16+dotprod']
+        RT_FLAGS = ['-O2', '-g', '-fPIC', '-Wall', '-fno-strict-aliasing', '-march=armv8.2-a+fp16+dotprod',
+                    '-DVK_NO_PROTOTYPES']
+        LINK_FLAGS = ['-shared', '-fuse-ld=lld', '-Wl,-soname,libmain.so', '-Wl,-z,noexecstack',
+                      '-Wl,--no-undefined', '-Wl,-z,max-page-size=16384', '"-Wl,-Map=$builddir/xc2.map"']
+        LINK_LIBS = ['-lSDL3', '-lopus', '-lvpx', '-lzstd', '-llog', '-landroid', '-ldl', '-lm', '-static-libstdc++']
+        if args.deps:
+            DEPS = args.deps.resolve()
+        elif (ROOT / 'toolchain' / 'deps-android').is_dir():
+            DEPS = (ROOT / 'toolchain' / 'deps-android').resolve()
+    elif args.toolchain:
         TOOLCHAIN_BIN = (args.toolchain / 'bin').resolve()
         CLANG = TOOLCHAIN_BIN / f'clang{suffix}'
         AR = TOOLCHAIN_BIN / f'llvm-ar{suffix}'
         WINDRES = TOOLCHAIN_BIN / 'llvm-windres.exe'
-    if args.toolchain and WIN or args.deps and (args.toolchain or not WIN):   # Linux: --deps only, never deps-mingw
+    if not ANDROID_TARGET and (args.toolchain and WIN or args.deps and (args.toolchain or not WIN)):
         DEPS = (args.deps or DEFAULT_DEPS).resolve()
         dlls = sorted((DEPS / 'bin').glob('*.dll')) if WIN else []
-    if DEPS and not WIN:
+    if DEPS and not WIN and not ANDROID_TARGET:
         # A release (--deps): Opus, libvpx and zstd go into the executable, so it needs no more than libc, Vulkan and
         # the libSDL3.so.0 beside it
         for lib in ('opus', 'vpx', 'zstd'):
@@ -1075,12 +1152,12 @@ def main():
             sys.exit(f'{expected}: no exefs_sha256 for {missing}')
         write_if_changed(out / 'modules.c',
                          module_glue(layout, linked, hashes, paths, args.version, title_id, game_name))
-        if (paths['romfs'] / 'index.json').is_file():
-            count, size, dt = romfs_index.write(paths['romfs'], out)
+        if (host_romfs / 'index.json').is_file():
+            count, size, dt = romfs_index.write(host_romfs, out)
             print(f'romfs index: {count} files, {mib(size)}, {dt:.1f} s')
         else:
             romfs_index.write_placeholder(out)
-            print(f'build_game: warning: no {paths["romfs"] / "index.json"}; {EXE} will have no RomFS', file=sys.stderr)
+            print(f'build_game: warning: no {host_romfs / "index.json"}; {EXE} will have no RomFS', file=sys.stderr)
         copy_romfs_patches(args.version, out)
         copy_prompts(args.version, out)
     global RUNTIME
@@ -1089,9 +1166,9 @@ def main():
     if stale:
         sys.exit(f'{stale[0]}: its SPIR-V header no longer matches; run python tools/build_shaders.py')
     skip = {s for s in args.skip_runtime.split(',') if s}
-    if not args.make_runtime_lib:   # before the compile: this stops the build, and a library holds no translator
+    if not args.make_runtime_lib and not ANDROID_TARGET:   # before the compile: this stops the build, and a library holds no translator
         check_translator(out, args.allow_stale_translator)
-    main_out = (ROOT / 'build' / args.version).resolve()
+    main_out = (ROOT / 'build' / default_ver_dir).resolve()
     pairs = None
     if args.make_runtime_lib:
         mods, linked, why = {}, [], ''
@@ -1162,9 +1239,10 @@ def main():
         return
     for dll in dlls:   # dynamic SDL3 (zlib) and its libiconv (LGPL, unmodified DLL), found next to xc2.exe
         shutil.copy2(dll, exe.parent / dll.name)
-    copy_translator(exe.parent)
-    copy_fsr3(exe.parent)
-    sections, image = pe_sections(exe) if WIN else elf_sections(exe)
+    if not ANDROID_TARGET:
+        copy_translator(exe.parent)
+        copy_fsr3(exe.parent)
+    sections, image = pe_sections(exe) if (WIN and not ANDROID_TARGET) else elf_sections(exe)
     print(f'{below_root(exe)}: file {mib(exe.stat().st_size)}, '
           f'image {mib(image)}; ' + ', '.join(f'{k} {mib(v)}' for k, v in sections.items() if k.startswith('.') and v))
     if image > 3 * GiB // 2:

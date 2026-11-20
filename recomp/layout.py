@@ -12,22 +12,26 @@ IPC buffers can encode.
 import json
 from pathlib import Path
 
-from nso import Nso
-
 FIRST_BASE = 0x7000000000
+ANDROID_FIRST_BASE = 0x4000000000   # Android 39-bit Zygote: clear of <4 GiB ART heap and >=0x55_0000_0000 PIE/linker
 ALIGN = 0x200000
 ADDRESS_LIMIT = 1 << 39
 ORDER = ['main'] + [f'subsdk{i}' for i in range(10)] + ['sdk']
+
+
+def first_base(target='desktop'):
+    return ANDROID_FIRST_BASE if target == 'android-arm64' else FIRST_BASE
 
 
 def align_up(v, a=ALIGN):
     return (v + a - 1) & ~(a - 1)
 
 
-def layout(exefs):
+def layout(exefs, target='desktop'):
     """[(name, base, size)] for the modules present in the ExeFS directory, in load order."""
+    from nso import Nso
     exefs = Path(exefs)
-    out, base = [], FIRST_BASE
+    out, base = [], first_base(target)
     for name in ORDER:
         path = exefs / name
         if not path.exists():

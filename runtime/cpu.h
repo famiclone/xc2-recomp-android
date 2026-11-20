@@ -42,9 +42,19 @@ uint64_t rt_ticks(void);
 #if defined(__aarch64__)
 static inline uint64_t rt_get_fpcr(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
 static inline uint64_t rt_get_fpsr(void) { uint64_t v; __asm__ volatile("mrs %0, fpsr" : "=r"(v)); return v; }
-static inline void rt_set_fpcr(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
-static inline void rt_set_fpsr(uint64_t v) { __asm__ volatile("msr fpsr, %0" :: "r"(v)); }
-static inline void rt_fpcr_sync(const Cpu *c) { (void)c; }
+static inline void rt_set_fpcr(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v) : "memory"); }
+static inline void rt_set_fpsr(uint64_t v) { __asm__ volatile("msr fpsr, %0" :: "r"(v) : "memory"); }
+// Under --simd=c on AArch64, host FPCR mirrors c->fpcr.FZ (bit 24) with RMode = nearest and DN/AHP = 0, matching the
+// invariant simd.h expects on x86-64 (directed rounding and FPCR.DN/AHP run through simd.h's explicit helpers).
+static inline void rt_fpcr_sync(const Cpu *c) {
+#if defined(RT_SIMD_ASM)
+    (void)c;
+#else
+    uint64_t cur = rt_get_fpcr();
+    uint64_t want = (cur & ~0x07c00000ull) | (c->fpcr & (1ull << 24));
+    if (cur != want) rt_set_fpcr(want);
+#endif
+}
 #else
 // Host FP state is not the guest's here: code lifted with --simd=c keeps FPCR/FPSR in Cpu (c->fpcr, zeroed
 // with the Cpu), so the host-side reset in thread start-up has nothing to do.
@@ -354,8 +364,8 @@ static inline uint32_t sdiv32(uint32_t a, uint32_t b) {
     return (uint32_t)((int32_t)a / (int32_t)b);
 }
 
-// Portable FP/SIMD helpers for code lifted with --simd=c (default off AArch64; gen.py includes simd.h itself
-// in that mode, so AArch64 hosts can build it too).
-#if !defined(__cplusplus) && !defined(__aarch64__)
+// Portable FP/SIMD helpers for code lifted with --simd=c (both x86-64 and AArch64; define RT_SIMD_ASM only for raw
+// inline-assembly SIMD harnesses).
+#if !defined(__cplusplus) && !defined(RT_SIMD_ASM)
 #include "simd.h"
 #endif

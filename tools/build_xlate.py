@@ -139,19 +139,32 @@ def main() -> None:
     parser.add_argument("--llvm", type=Path, help="Linux: an LLVM directory whose bin/clang and lld link the exe")
     parser.add_argument("--sysroot", type=Path, help="Linux: link against this sysroot's glibc instead of the host's "
                                                      "(tools/make_release_linux.py)")
+    parser.add_argument("--target", choices=("host", "android-arm64"), default="host",
+                        help="target platform (host or android-arm64 Bionic single-file executable libxc2_xlate.so)")
     a = parser.parse_args()
     if a.out:
         global BUILD
         BUILD = a.out.resolve()
+    out_exe_name = "libxc2_xlate.so" if a.target == "android-arm64" else EXE
     if a.id_only:
+        BUILD.mkdir(parents=True, exist_ok=True)
         write_identity(BUILD / EXE)
         return
     started = time.time()
-    dotnet = shutil.which("dotnet")
+    dotnet = None
+    for cand in (ROOT / "toolchain" / "dotnet" / ("dotnet.exe" if WIN else "dotnet"),
+                 shutil.which("dotnet"),
+                 "/opt/homebrew/bin/dotnet",
+                 "/usr/local/share/dotnet/dotnet"):
+        if cand and Path(cand).is_file():
+            ver = subprocess.run([str(cand), "--version"], capture_output=True, text=True).stdout.strip()
+            if ver.split(".")[0].isdigit() and int(ver.split(".")[0]) >= 10:
+                dotnet = str(cand)
+                break
     if not dotnet:
-        sys.exit("missing: dotnet (.NET 10 SDK)")
+        sys.exit("missing: dotnet (.NET 10 SDK; install into toolchain/dotnet or PATH)")
     env = dict(os.environ)
-    if WIN:
+    if WIN and a.target == "host":
         if not (VSWHERE_DIR / "vswhere.exe").is_file() and not shutil.which("vswhere"):
             sys.exit(f"missing: vswhere.exe (expected in {VSWHERE_DIR}); NativeAOT cannot link without it")
         env["PATH"] = str(VSWHERE_DIR) + os.pathsep + env["PATH"]
@@ -165,10 +178,42 @@ def main() -> None:
         shutil.copy2(XLATE / name, work / name)
     out = BUILD / "publish"
     shutil.rmtree(out, ignore_errors=True)
-    cmd = [
-        dotnet, "publish", str(work / "xc2_xlate.csproj"), "-c", "Release", "-r", "win-x64" if WIN else "linux-x64",
-        "-p:PublishAot=true", "-p:InvariantGlobalization=true", f"-p:RyuSrc={src}", "-o", str(out),
-    ]
+    if a.target == "android-arm64":
+        sys.path.insert(0, str(ROOT / "tools"))
+        import build_game
+        ndk_bin = build_game.find_android_ndk_bin(None)
+        if not ndk_bin:
+            sys.exit("Android NDK not found; set ANDROID_NDK_HOME")
+        ndk_sysroot = ndk_bin.parent / "sysroot"
+        ndk_clang = ndk_bin / ("clang.exe" if WIN else "clang")
+        ndk_target_clang = ndk_bin / ("aarch64-linux-android29-clang.cmd" if WIN else "aarch64-linux-android29-clang")
+        ndk_objcopy = ndk_bin / ("llvm-objcopy.exe" if WIN else "llvm-objcopy")
+        init_obj = work / "android_init.o"
+        subprocess.run([str(ndk_target_clang), "-O2", "-fPIC", "-c", str(XLATE / "android_host.c"), "-o", str(init_obj)],
+                       check=True)
+        (work / "Directory.Build.targets").write_text(
+            "<Project>\n"
+            "  <ItemGroup>\n"
+            "    <LinkerArg Include=\"-Wl,-z,max-page-size=16384\" />\n"
+            "    <NativeLibrary Include=\"$(MSBuildThisFileDirectory)android_init.o\" />\n"
+            "  </ItemGroup>\n"
+            "</Project>\n",
+            encoding="utf-8",
+        )
+        rid = "linux-bionic-arm64"
+        cmd = [
+            dotnet, "publish", str(work / "xc2_xlate.csproj"), "-c", "Release", "-r", rid,
+            "-p:PublishAot=true", "-p:PublishAotUsingRuntimePack=true",
+            "-p:InvariantGlobalization=true", "-p:CrossCompileAbi=android29",
+            f"-p:SysRoot={ndk_sysroot}", f"-p:CppCompilerAndLinker={ndk_clang}",
+            f"-p:ObjCopyName={ndk_objcopy}", f"-p:RyuSrc={src}", "-o", str(out),
+        ]
+    else:
+        rid = "win-x64" if WIN else ("osx-arm64" if sys.platform == "darwin" else "linux-x64")
+        cmd = [
+            dotnet, "publish", str(work / "xc2_xlate.csproj"), "-c", "Release", "-r", rid,
+            "-p:PublishAot=true", "-p:InvariantGlobalization=true", f"-p:RyuSrc={src}", "-o", str(out),
+        ]
     if a.llvm:
         env["PATH"] = str(a.llvm.resolve() / "bin") + os.pathsep + env["PATH"]
         cmd += ["-p:CppCompilerAndLinker=clang", "-p:LinkerFlavor=lld"]
@@ -176,9 +221,14 @@ def main() -> None:
         cmd.append(f"-p:SysRoot={a.sysroot.resolve()}")
     if subprocess.run(cmd, env=env).returncode != 0:
         sys.exit("dotnet publish failed")
-    exe = BUILD / EXE
-    shutil.copy2(out / EXE, exe)
-    write_identity(exe)
+    exe = BUILD / out_exe_name
+    if a.target == "android-arm64":
+        shutil.copy2(out / "xc2_xlate", exe)
+        shutil.rmtree(BUILD / "android-libs", ignore_errors=True)
+        shutil.rmtree(BUILD / "android-managed", ignore_errors=True)
+    else:
+        shutil.copy2(out / EXE, exe)
+    write_identity(BUILD / EXE)
     print(f"built {exe} ({exe.stat().st_size / 1e6:.1f} MB) in {time.time() - started:.0f} s")
 
 

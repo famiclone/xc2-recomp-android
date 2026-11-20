@@ -19,13 +19,20 @@
 
 #define PAGE 0x1000ull
 #define GiB (1ull << 30)
+#ifdef __ANDROID__
+// Android ARM64 Zygote uses a 39-bit address space: the compressed-OOP ART heap sits below 4 GiB and PIE/linker mappings
+// sit above 0x55_0000_0000, leaving [16 GiB, 256 GiB) clear for the guest stack/heap block and a 16 GiB alias reservation.
+#define LOW_SEARCH_FROM 0x400000000ull
+#define ALIAS_SIZE (16 * GiB)
+#else
 #define LOW_SEARCH_FROM 0x100000000ull
+#define ALIAS_SIZE (64 * GiB)
+#endif
 #define LOW_SIZE (6 * GiB)
 #define STACK_OFF 0x10000000ull
 #define STACK_SIZE 0x10000000ull
 #define HEAP_OFF (STACK_OFF + STACK_SIZE + 0x10000000ull)
 #define HEAP_CAP (5 * GiB)                // XC2 above 1280x720 adds to the pool (resolution.c)
-#define ALIAS_SIZE (64 * GiB)
 #define ALIAS_ALIGN (4 * GiB)
 #define ALIAS_PAGES (ALIAS_SIZE / PAGE)
 #define DEFAULT_POOL 0xCD500000ull       // retail application pool
@@ -120,6 +127,7 @@ void mem_thaw(uint64_t a, uint64_t n) {
     plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
     thaw_range_locked(a, n, 2);
     plat_mutex_unlock(&frz_lock);
+    plat_mem_disarm(a, n);
 }
 
 // frz_lock held exclusively. Makes the committed pages of region r read-only when every one of them is read-write;
@@ -217,6 +225,9 @@ static void protect(uint64_t a, uint64_t n, int prot, const char *what) {
 // The process is re-run when a region is taken: Windows places DLLs, heaps and thread stacks at random addresses,
 // and a fresh process gets a fresh layout.
 static void reexec_or_fail(const char *what) {
+#ifdef __ANDROID__
+    rt_fatal("memory: %s is not free in Android Zygote address space", what);
+#else
     const char *e = cfg_get("XC2_REEXEC");
     int n = e ? atoi(e) : 0;
     if (n >= REEXEC_LIMIT) rt_fatal("memory: %s is not free after %d attempts", what, n);
@@ -224,6 +235,7 @@ static void reexec_or_fail(const char *what) {
     snprintf(buf, sizeof buf, "%d", n + 1);
     plat_setenv("XC2_REEXEC", buf);
     plat_reexec();
+#endif
 }
 
 void mem_init(void) {

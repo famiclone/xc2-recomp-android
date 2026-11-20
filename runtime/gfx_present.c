@@ -229,6 +229,7 @@ static void window_settings_live(void) {
 
 // ---- swapchain
 static const char *g_present_got = "";   // the XC2_VK_PRESENT value of the mode the swapchain got; "" before one
+static int g_sc_xform_suboptimal;        // 1 when preTransform != currentTransform (Android DPU rotation returns VK_SUBOPTIMAL_KHR every frame)
 
 static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
     const char *e = cfg_value("XC2_VK_PRESENT");
@@ -266,7 +267,7 @@ static void flip_locked(void) {
     VkResult r = vk_fg_present(vk_ctx()->gfx_queue, &pi);   // the frame generation swapchain presents, else this does
     vk_queue_unlock();
     vk_device_fault_report(r);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || (r == VK_SUBOPTIMAL_KHR && !g_sc_xform_suboptimal)) plat_xchg32(&g_dirty, 1);
 }
 
 static void free_capture(void) {
@@ -316,12 +317,19 @@ static int create_swapchain(void) {
         old = VK_NULL_HANDLE;
         g_sc = VK_NULL_HANDLE;
     }
+    // The present blits and menu render upright into ext; when the surface supports IDENTITY (Android DPU/SurfaceFlinger,
+    // desktop compositors), let the presentation engine apply any physical panel rotation rather than claiming the
+    // image was pre-rotated.
+    VkSurfaceTransformFlagBitsKHR pre_transform =
+        (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+            ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+            : caps.currentTransform;
     VkSwapchainCreateInfoKHR ci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_surface, .minImageCount = count,
         .imageFormat = sf.format, .imageColorSpace = sf.colorSpace, .imageExtent = ext, .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,   // every surface supports it (the menu overlay draws into it)
-        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = pre_transform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = pick_present_mode(c->phys), .clipped = VK_TRUE,
         .oldSwapchain = old};
     int fg = vk_fg_wanted();
@@ -354,11 +362,13 @@ static int create_swapchain(void) {
     if (!fg && old) vkDestroySwapchainKHR(c->device, old, NULL);
     g_sc_fmt = sf.format;
     g_sc_ext = ext;
+    g_sc_xform_suboptimal = pre_transform != caps.currentTransform;
     g_sc_n = 0;
     vk_fg_images(c->device, g_sc, &g_sc_n, NULL);   // count only: the library does not write the count back with an array
     if (g_sc_n > MAX_IMAGES) g_sc_n = MAX_IMAGES;
     if (g_sc_n) vk_fg_images(c->device, g_sc, &g_sc_n, g_sc_img);
-    rt_log("gfx: swapchain ready, %u images, frame generation %s", g_sc_n, vk_fg_active() ? "on" : "off");
+    rt_log("gfx: swapchain ready, %u images, transform 0x%x (current 0x%x), frame generation %s", g_sc_n,
+           (unsigned)pre_transform, (unsigned)caps.currentTransform, vk_fg_active() ? "on" : "off");
     VkSemaphoreCreateInfo semi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (uint32_t i = 0; i < g_sc_n; i++) {
         vkCreateSemaphore(c->device, &semi, NULL, &g_render_done[i]);
@@ -580,7 +590,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     }
     vk_device_fault_report(r);
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) goto out;     // lost, not ready: skip the frame
-    if (r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
+    if (r == VK_SUBOPTIMAL_KHR && !g_sc_xform_suboptimal) plat_xchg32(&g_dirty, 1);
     vkResetFences(c->device, 1, &g_fence[slot]);
     if (g_th_pending[slot]) {   // that fence has signalled: the thumbnail its submission wrote is complete
         g_th_tag[g_th_pending[slot] % (uint64_t)g_th_n] = g_th_pending[slot];

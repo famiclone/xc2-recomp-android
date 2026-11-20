@@ -61,14 +61,14 @@ SN T FN(nan3)(Cpu *c, T a, T b, T d) {
 
 // The arithmetic itself, for scalars (KK = K) and vectors (KK = VK). MADD: a + b*d (a = addend).
 // RECPS/RSQRTS get their first operand already negated (FPNeg happens before NaN processing).
-#define FCALC(op, a, b, d, KK)                                                                       \
+#define FCALC(op, a, b, d, KK, SQ, FM)                                                               \
     ((op) == FOP_ADD ? (a) + (b) : (op) == FOP_SUB ? (a) - (b)                                     \
    : (op) == FOP_MUL || (op) == FOP_MULX ? (a) * (b) : (op) == FOP_NMUL ? -((a) * (b))              \
    : (op) == FOP_DIV ? (a) / (b) : (op) == FOP_ABD ? __builtin_elementwise_abs((a) - (b))          \
-   : (op) == FOP_SQRT ? __builtin_elementwise_sqrt(a)                                              \
-   : (op) == FOP_MADD ? __builtin_elementwise_fma(b, d, a)                                         \
-   : (op) == FOP_RECPS ? __builtin_elementwise_fma(a, b, KK(2))                                    \
-   : (op) == FOP_RSQRTS ? __builtin_elementwise_fma(a, b, KK(3)) * KK(0.5) : (a))
+   : (op) == FOP_SQRT ? SQ(a)                                                                       \
+   : (op) == FOP_MADD ? FM(b, d, a)                                                                 \
+   : (op) == FOP_RECPS ? FM(a, b, KK(2))                                                            \
+   : (op) == FOP_RSQRTS ? FM(a, b, KK(3)) * KK(0.5) : (a))
 
 // Lanes whose fast result needs fixing: NaN results (NaN operand or invalid op), RSQRTS overflow.
 #define FBAD(op, r) ((op) == FOP_RSQRTS ? ((r) != (r)) | (__builtin_elementwise_abs(r) == K(INFINITY)) : (r) != (r))
@@ -76,9 +76,9 @@ SN T FN(nan3)(Cpu *c, T a, T b, T d) {
 // (3 + a*b) / 2 with one rounding (a already negated): halve a normal operand first, so a product beyond
 // the format's range (which the fast path rounds to inf, or to the largest normal when rounding down) is exact.
 SN T FN(rsqrts)(T a, T b) {
-    if (__builtin_elementwise_abs(a) >= FN(fv)(2 * MINN)) return __builtin_elementwise_fma(a * K(0.5), b, K(1.5));
-    if (__builtin_elementwise_abs(b) >= FN(fv)(2 * MINN)) return __builtin_elementwise_fma(a, b * K(0.5), K(1.5));
-    return __builtin_elementwise_fma(a, b, K(3)) * K(0.5);
+    if (__builtin_elementwise_abs(a) >= FN(fv)(2 * MINN)) return FN(ffma)(a * K(0.5), b, K(1.5));
+    if (__builtin_elementwise_abs(b) >= FN(fv)(2 * MINN)) return FN(ffma)(a, b * K(0.5), K(1.5));
+    return FN(ffma)(a, b, K(3)) * K(0.5);
 }
 
 // ARM result for a lane flagged by FBAD (operands already flushed).
@@ -136,13 +136,13 @@ SN T FN(slow)(Cpu *c, int op, T a, T b, T d) {
     if (FMINMAX(op)) return FN(minmax)(c, op, a, b);
     unsigned old = simd_rm_enter(fpcr);
     volatile T va = a, vb = b, vd = d;
-    volatile T vr = op == FOP_RSQRTS ? FN(rsqrts)(va, vb) : FCALC(op, va, vb, vd, K);
+    volatile T vr = op == FOP_RSQRTS ? FN(rsqrts)(va, vb) : FCALC(op, va, vb, vd, K, FN(fsqrt), FN(ffma));
     T r = vr;
     if (FBAD(op, r)) vr = FN(fix)(c, op, a, b, d), r = vr;
     if ((fpcr & FPCR_FZ) && (FN(fb)(r) & ~SGN) <= MINN && !FN(iszero)(FN(fb)(r))) {
         if ((FN(fb)(r) & ~SGN) == MINN) {
             simd_rm_rz();
-            volatile T vz = FCALC(op, va, vb, vd, K);
+            volatile T vz = FCALC(op, va, vb, vd, K, FN(fsqrt), FN(ffma));
             if ((FN(fb)(vz) & ~SGN) < MINN) r = FN(fv)(FN(fb)(r) & SGN);
         } else {
             r = FN(fv)(FN(fb)(r) & SGN);
@@ -172,7 +172,7 @@ SI T FN(op)(Cpu *c, int op, T a, T b, T d) {
         if (c->fpcr & FPCR_FZ) a = FN(flush)(a), b = FN(flush)(b);
         return FN(minmax)(c, op, a, b);
     }
-    T r = FCALC(op, a, b, d, K);
+    T r = FCALC(op, a, b, d, K, FN(fsqrt), FN(ffma));
     if (__builtin_expect(op == FOP_RSQRTS ? FREDO(op, r) : !FOK(r), 0)) r = FN(redo)(c, op, a, b, d, r);
     return r;
 }
@@ -187,7 +187,11 @@ SI VTU FN(vsel)(VTS m, VTU x, VTU y) { return (x & (VTU)m) | (y & ~(VTU)m); }
 
 SI VT FN(vflush)(VT a) {
     VTU u = (VTU)a;
+#if defined(__aarch64__)
+    __asm__("" : "+w"(u));
+#else
     __asm__("" : "+x"(u));
+#endif
     VTU mag = u & ~((VTU){} + SGN);
     VTS den = (mag != 0) & ((u & EXPM) == 0);
     return (VT)FN(vsel)(den, u & SGN, u);
@@ -207,7 +211,7 @@ SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
             r = (VT)FN(vsel)(a < b, x, FN(vsel)(a == b, x | y, y));
         return r;
     }
-    r = FCALC(op, a, b, d, VK);
+    r = FCALC(op, a, b, d, VK, FN(vfsqrt), FN(vffma));
     if (__builtin_expect(op == FOP_RSQRTS ? __builtin_reduce_or(FREDO(op, r)) != 0 : __builtin_reduce_and(FOK(r)) == 0, 0))
         return FN(vslow)(c, op, a, b, d);
     return r;
@@ -235,11 +239,11 @@ SI VTU FN(vcmp)(Cpu *c, int op, VT a, VT b) {
 // (rint = ties-to-even: the host stays in round-to-nearest outside the slow paths; no roundeven in MinGW's CRT)
 SI T FN(rnd)(T x, int rm) {
     switch (rm) {
-    case 0: return __builtin_elementwise_rint(x);
+    case 0: return SIMD_RINT(x);
     case 1: return __builtin_elementwise_ceil(x);
     case 2: return __builtin_elementwise_floor(x);
     case 3: return __builtin_elementwise_trunc(x);
-    default: return __builtin_elementwise_round(x);
+    default: return FN(frnda)(x);
     }
 }
 SI T FN(frint)(Cpu *c, T x, int rm) {
@@ -254,11 +258,11 @@ SI VT FN(vfrint)(Cpu *c, VT x, int rm) {
     if (rm >= 5) rm = (int)((c->fpcr >> 22) & 3);
     VT r;
     switch (rm) {
-    case 0: r = __builtin_elementwise_rint(x); break;
+    case 0: r = SIMD_RINT(x); break;
     case 1: r = __builtin_elementwise_ceil(x); break;
     case 2: r = __builtin_elementwise_floor(x); break;
     case 3: r = __builtin_elementwise_trunc(x); break;
-    default: r = __builtin_elementwise_round(x); break;
+    default: r = FN(vfrnda)(x); break;
     }
     if (__builtin_expect(__builtin_reduce_or(r != r) != 0, 0))
         for (int i = 0; i < NL; i++)

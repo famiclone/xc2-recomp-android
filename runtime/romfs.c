@@ -540,11 +540,9 @@ static void index_path(char *out, size_t cap) {
         need(snprintf(out, cap, "%s", e) < (int)cap, "index path");
         return;
     }
-    need(plat_exe_path(out, cap), "executable path");
-    char *sep = plat_last_sep(out);
-    size_t k = sep ? (size_t)(sep - out) + 1 : 0;
-    need(k + 16 < cap, "executable path");
-    strcpy(out + k, "romfs-index.bin");
+    char dir[2048];
+    need(plat_data_dir(dir, sizeof dir), "data directory");
+    need(snprintf(out, cap, "%s/romfs-index.bin", dir) < (int)cap, "executable path");
 }
 
 static void load_index(void) {

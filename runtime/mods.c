@@ -231,11 +231,10 @@ static int same_build(const char *hex, size_t n) {
 static const char *exefs_status(void) {
     static char *text;
     if (text) return text;
-    char path[2100];
+    char dir[2048], path[2100];
     uint64_t n = 0;
-    if (plat_exe_path(path, sizeof path)) {
-        char *cut = plat_last_sep(path);
-        if (cut) snprintf(cut + 1, sizeof path - (size_t)(cut + 1 - path), "build-cache/exefs.status");
+    if (plat_data_dir(dir, sizeof dir)) {
+        snprintf(path, sizeof path, "%s/build-cache/exefs.status", dir);
         text = (char *)plat_file_read(path, &n);
     }
     if (!text) text = calloc(1, 1);
@@ -402,12 +401,9 @@ void mods_scan(void) {
     if (d && *d) {
         snprintf(dir, sizeof dir, "%s", d);
     } else {
-        char exe[2048];
-        if (!plat_exe_path(exe, sizeof exe)) return;
-        char *cut = plat_last_sep(exe);
-        if (!cut) return;
-        *cut = 0;
-        snprintf(dir, sizeof dir, "%s/mods", exe);
+        char data[2048];
+        if (!plat_data_dir(data, sizeof data)) return;
+        snprintf(dir, sizeof dir, "%s/mods", data);
     }
     if (!plat_dir_exists(dir)) {
         rt_log("mods: no folder %s", dir);

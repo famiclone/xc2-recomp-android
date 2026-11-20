@@ -37,6 +37,26 @@
 // the present, which can run while the next frame is already on the GPU.
 #include "vk_exec.h"
 
+#ifdef __ANDROID__
+// Desktop AMD FSR 3.1 / 4 SDK DLLs are x86-64 Windows/Linux libraries; Android uses the lightweight FSR 1 spatial
+// upscaler (vk_fsr.c) or native bilinear presentation to stay within the 8 GB unified RAM budget.
+#include <stdio.h>
+#include <string.h>
+#include "host.h"
+
+void vk_fsr3_note(VkExec *ex) { (void)ex; }
+void vk_fsr3_resolve(VkExec *ex) { if (ex) ex->fsr3_armed = 0; }
+void vk_fsr3_frame_take(VkFsrFrame *out) { if (out) memset(out, 0, sizeof *out); }
+void vk_fsr3_frame_show(const VkFsrFrame *fr) { (void)fr; }
+int vk_fsr3_frame_get(VkFsrFrame *out) { (void)out; return 0; }
+void vk_fsr3_release(void) {}
+int probe_fsr(void) {
+    printf("probe-fsr: skipped (AMD FSR 3.1/4 SDK disabled on Android)\n");
+    return 0;
+}
+
+#else
+
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -803,3 +823,5 @@ out:
     vk_shutdown();
     return rc;
 }
+
+#endif // __ANDROID__

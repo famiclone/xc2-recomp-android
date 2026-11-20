@@ -42,13 +42,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'recomp'))
 import flags  # noqa: E402
+from layout import first_base  # noqa: E402
 from lifter import Lifter, Unsupported  # noqa: E402
 from nso import Nso  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import xc2_titles  # noqa: E402
 
-BASE = 0x7000000000   # main's base in the layout (recomp/layout.py); only pc-relative decoding sees it
+BASE = first_base('desktop')   # main's base in the layout (recomp/layout.py); only pc-relative decoding sees it
 NOP = 0xD503201F
 RET = 0xD65F03C0
 
@@ -354,7 +355,11 @@ def main():
     ap.add_argument('--patches', type=Path, help='the game version\'s patch file')
     ap.add_argument('--out', type=Path, required=True, help='the patch file with the cheats added')
     ap.add_argument('--status', type=Path, required=True)
+    ap.add_argument('--target', choices=('desktop', 'android-arm64'), default='desktop',
+                    help='target address layout (recomp/layout.py)')
     args = ap.parse_args()
+    global BASE
+    BASE = first_base(args.target)
     sys.stdout.reconfigure(errors='replace')   # cheat names in a console without their characters
     m = Main(args.exefs / 'main')
     text = args.patches.read_text() if args.patches and args.patches.is_file() else ''

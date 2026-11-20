@@ -2038,7 +2038,7 @@ static void bind_vertex_buffers(VkExec *ex) {
     int dyn = vk_pipeline_vertex_input_dynamic();
     // A stream whose range is the one its bound buffer was resolved from, with no pool or mirror change since
     // (vk_mem_gen, read before any resolve), resolves to that buffer again: most draws change one stream or none.
-    uint64_t gen = vk_mem_gen();
+    uint64_t gen = vk_mem_gen() ^ (vk_mem_unified_on() ? vk_usnap_gen() * 0x9e3779b97f4a7c15ull : 0);
     int same_gen = B.vb_valid && B.vgen == gen;
     for (int b = 0; b < 17; b++) {
         vb[b] = Z.zbuf, vo[b] = 0, vsz[b] = ZERO_BYTES, vstr[b] = b < 16 ? ex->pipe.vstream[b].stride : 0;
@@ -2050,8 +2050,13 @@ static void bind_vertex_buffers(VkExec *ex) {
         }
         VkMemSpan sp;
         if (!r->address || !vk_mem_resolve(r->address, 1, &sp)) continue;
-        VK_MEM_USE(sp);
         uint64_t n = r->size && r->size < sp.avail ? r->size : sp.avail;
+        VkDescriptorBufferInfo vbi;
+        if (vk_mem_unified_on() && n && vk_usnap_find(r->address, n, 1, &vbi)) {
+            vb[b] = vbi.buffer, vo[b] = vbi.offset, vsz[b] = vbi.range, vcls[b] = VK_MCLS_SCRATCH;
+            continue;
+        }
+        VK_MEM_USE(sp);
         vb[b] = sp.buffer, vo[b] = sp.offset, vsz[b] = n, vcls[b] = sp.cls, vpool[b] = sp.pool;
         if (vk_capture_on) vk_capture_note(r->address, n);   // XC2_CAPTURE: the vertex bytes this stream reads
     }

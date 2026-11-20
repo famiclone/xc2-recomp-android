@@ -30,11 +30,21 @@ def base_records(records):
     return kept
 
 
+def update_records(records):
+    """records minus a bundled base game or DLCs when a combined XCI/NSP is passed as an update."""
+    update_titles = {r.update_title for r in xc2_titles.REGIONS}
+    if not any(r['content_type'] == 1 and r['title_id'].upper() in update_titles for r, _ in records):
+        return records
+    return [(r, h) for r, h in records
+            if (r['content_type'] == 1 and r['title_id'].upper() in update_titles)
+            or (r['content_type'] == 0 and is_bktr(h))]
+
+
 def program_nca(records, update=False):
     """The Program NCA of an XC2 base or update package (tools/xc2_extract.py program_nca; the vendored selector knows
-    XCX's title ids), a combined dump's bundled update dropped for the base."""
+    XCX's title ids), a combined dump's other content sets dropped."""
     import xc2_extract
-    return xc2_extract.program_nca(records if update else base_records(records), update=update)
+    return xc2_extract.program_nca(update_records(records) if update else base_records(records), update=update)
 
 
 def run(path):

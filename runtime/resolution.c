@@ -136,9 +136,20 @@ int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n) {
 }
 void res_heapdef_served(void) {}
 
+static int is_xc2_title(void) {
+    return rt_title_id == 0x0100E95004038000ull || rt_title_id == 0x0100F3400332C000ull;
+}
+
 static int xc2_res_init(void) {
     uint8_t *page = rt_patch_page();
-    if (!xc2_decide() || !page) return 0;
+    if (!xc2_decide() || !page) {
+        if (is_xc2_title()) {
+            R.ow = XC2_W, R.oh = XC2_H, R.xc2 = 1;
+            rt_log("resolution: the game's own (%ux%u, no xc2res patch set)", R.ow, R.oh);
+            return 1;
+        }
+        return 0;
+    }
     int set = rt_patch_set("xc2res");
     R.ow = X.w, R.oh = X.h;
     // +0x80: the camera viewport the markers are placed with (patches-v301.txt), 1280x720 at 16:9; the camera takes its

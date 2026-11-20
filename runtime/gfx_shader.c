@@ -33,6 +33,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#include <SDL3/SDL_iostream.h>
+#include <SDL3/SDL_stdinc.h>
+#include <SDL3/SDL_system.h>
+#endif
 
 #include "cfg.h"
 #include "gfx.h"
@@ -168,16 +174,44 @@ static void xlate_identity(void) {
         strcpy(text, id_env);
         if (!hex32(text, xlate_id)) rt_sha256(text, strlen(text), xlate_id);
     } else {
-        char p[PATH_CAP + 8];
-        strcpy(p, xlate_exe);
-        char *dot = strrchr(p, '.'), *sep = plat_last_sep(p);
-        if (dot && dot > sep) *dot = 0;
-        strcat(p, ".id");
+        char p[PATH_CAP + 32] = "";
+        if (xlate_exe[0]) {
+            strcpy(p, xlate_exe);
+            char *dot = strrchr(p, '.'), *sep = plat_last_sep(p);
+            if (dot && dot > sep) *dot = 0;
+            strcat(p, ".id");
+        }
+        if (!p[0] || !file_exists(p)) {
+            char data_dir[PATH_CAP];
+            if (plat_data_dir(data_dir, sizeof data_dir)) {
+                snprintf(p, sizeof p, "%s/xc2_xlate.id", data_dir);
+                if (!file_exists(p) && cache_dir[0]) snprintf(p, sizeof p, "%s/xc2_xlate.id", cache_dir);
+            }
+        }
         uint64_t size = 0;
-        char *f = (char *)read_file(p, &size);
-        how = "xc2_xlate.id";
+        char *f = NULL;
+#ifdef __ANDROID__
+        if (!strncmp(xlate_exe, "/data/", 6)) {
+            size_t asz = 0;
+            char *af = (char *)SDL_LoadFile("xc2_xlate.id", &asz);
+            if (af && asz > 0) {
+                f = malloc(asz + 1);
+                if (f) {
+                    memcpy(f, af, asz);
+                    f[asz] = 0;
+                    size = asz;
+                    how = "assets/xc2_xlate.id";
+                }
+            }
+            if (af) SDL_free(af);
+        }
+#endif
+        if (!f && p[0]) {
+            f = (char *)read_file(p, &size);
+            how = "xc2_xlate.id";
+        }
         if (!f || !hex32(f, xlate_id)) {
-            uint8_t *exe = read_file(xlate_exe, &size);
+            uint8_t *exe = xlate_exe[0] ? read_file(xlate_exe, &size) : NULL;
             how = exe ? "sha256 of the exe; tools/build_xlate.py writes xc2_xlate.id" : "none: no translator";
             if (exe) rt_sha256(exe, (size_t)size, xlate_id);
             free(exe);
@@ -195,9 +229,9 @@ static void use_preload_start(void);
 static void init_paths(void *param) {
     (void)param;
     char exe[PATH_CAP], root[PATH_CAP] = "", exe_dir[PATH_CAP] = "";
+    plat_data_dir(exe_dir, sizeof exe_dir);
+#ifndef __ANDROID__
     if (plat_exe_path(exe, sizeof exe)) {
-        char *last = plat_last_sep(exe);
-        if (last) snprintf(exe_dir, sizeof exe_dir, "%.*s", (int)(last - exe), exe);
         for (char *cut = plat_last_sep(exe); cut; cut = plat_last_sep(exe)) {
             *cut = 0;
             char probe[PATH_CAP + 32];
@@ -208,10 +242,28 @@ static void init_paths(void *param) {
             }
         }
     }
+#else
+    (void)exe;
+    char jni_xlate[PATH_CAP + 32] = "";
+    Dl_info dli;
+    if (dladdr((const void *)init_paths, &dli) && dli.dli_fname && dli.dli_fname[0] == '/') {
+        snprintf(jni_xlate, sizeof jni_xlate, "%s", dli.dli_fname);
+        char *cut = plat_last_sep(jni_xlate);
+        if (cut) snprintf(cut + 1, sizeof jni_xlate - (size_t)(cut + 1 - jni_xlate), "libxc2_xlate.so");
+        else jni_xlate[0] = 0;
+    }
+    const char *acache = SDL_GetAndroidCachePath();
+    const char *ainternal = SDL_GetAndroidInternalStoragePath();
+    if (ainternal && ainternal[0]) plat_setenv("HOME", ainternal);
+    if (acache && acache[0]) plat_setenv("TMPDIR", acache);
+#endif
     const char *xlate_cfg = cfg_get("XC2_XLATE"), *cache_cfg = cfg_get("XC2_SHADER_CACHE");
     char beside[PATH_CAP + 32];   // a packaged folder (tools/package_build.py) keeps the translator next to xc2.exe
     if (exe_dir[0]) snprintf(beside, sizeof beside, "%s/xc2_xlate" PLAT_EXE_SUFFIX, exe_dir);
     if (xlate_cfg && *xlate_cfg && strlen(xlate_cfg) < sizeof xlate_exe) strcpy(xlate_exe, xlate_cfg);
+#ifdef __ANDROID__
+    else if (jni_xlate[0] && file_exists(jni_xlate)) strcpy(xlate_exe, jni_xlate);
+#endif
     else if (exe_dir[0] && file_exists(beside)) strcpy(xlate_exe, beside);
     else if (root[0]) snprintf(xlate_exe, sizeof xlate_exe, "%s/build/xlate/xc2_xlate" PLAT_EXE_SUFFIX, root);
     if (cache_cfg && *cache_cfg && strlen(cache_cfg) < sizeof cache_dir) strcpy(cache_dir, cache_cfg);
@@ -251,6 +303,14 @@ static void child_stop(Svc *v) {
 
 static int child_start(Svc *v) {
     paths();
+#ifdef __ANDROID__
+    if (!xlate_exe[0]) {
+        static int warned;
+        if (!warned++)
+            rt_log("gfx_shader: shader cache miss on Android (no runtime translator; pre-populate shader-cache/ on desktop)");
+        return 0;
+    }
+#endif
     if (!xlate_exe[0] || !file_exists(xlate_exe)) {
         rt_log("gfx_shader: translator not found (%s); set XC2_XLATE", xlate_exe[0] ? xlate_exe : "<none>");
         return 0;

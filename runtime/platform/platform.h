@@ -10,6 +10,8 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include "fp_x86.h"
 #include <immintrin.h>
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include "fp_arm64.h"
 #endif
 
 // ---- threads
@@ -73,6 +75,8 @@ void plat_yield(void);                    // gives the rest of the time slice to
 static inline void plat_pause(void) {     // spin-wait hint
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    __asm__ volatile("yield" ::: "memory");
 #endif
 }
 
@@ -193,6 +197,12 @@ int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end);
 // The pages of a watched reservation written since the last reset, up to max page addresses into pages, in address
 // order; reset: those reported start over as unwritten. UINT64_MAX when writes to the range are not tracked.
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset);
+#ifdef __ANDROID__
+// Disarms soft write-watch protection over [addr, addr + n) and marks watched RW pages dirty before kernel reads/remaps.
+void plat_mem_disarm(uint64_t addr, uint64_t n);
+#else
+static inline void plat_mem_disarm(uint64_t addr, uint64_t n) { (void)addr, (void)n; }
+#endif
 // A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and
 // the write should run again, 0 to let the fault go on (to the crash handler). One hook per process.
 void plat_mem_fault_hook(int (*fn)(uint64_t addr));
@@ -312,6 +322,7 @@ int plat_file_set_size(PlatFile *f, uint64_t size);       // PLAT_FS_*
 int plat_file_fsync(PlatFile *f);                         // the file's data to the disk; 1 on success
 int plat_temp_dir(char *out, size_t cap);                 // the user's temporary directory, no trailing separator
 int plat_exe_path(char *out, size_t cap);                 // path of the running executable; 0 on failure
+int plat_data_dir(char *out, size_t cap);                 // writable game data/config directory, no trailing separator
 uintptr_t plat_exe_base(void);                            // where the executable is loaded
 // The module (executable or library) holding code address addr: its file name without directories into name, its load
 // address into *base. 0 when none.
@@ -376,6 +387,12 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb);
 // This process's memory in bytes: resident (the working set) and private (Windows: committed private bytes; Linux: the
 // resident anonymous pages). 0 when unknown.
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes);
+#ifdef __ANDROID__
+// Android /proc/self/status memory telemetry in MB (-1 when unavailable): VmRSS, VmSwap (zram pressure before lmkd), RssAnon.
+void plat_android_mem_status(float *rss_mb, float *swap_mb, float *anon_mb);
+// Adreno KGSL sysfs GPU temperature (C) and graphics clock (MHz); -1 when unavailable.
+void plat_android_gpu_extra(PlatLoad *l, float *temp_c, float *clock_mhz);
+#endif
 
 // ---- child processes: a program with stdin and stdout piped to us (stderr discarded), no console window.
 typedef struct PlatChild PlatChild;

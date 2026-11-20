@@ -1,0 +1,79 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.xc2recomp.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.xc2recomp.app'
+        minSdk 29
+        targetSdk 34
+        versionCode 1
+        versionName '0.1.0'
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_static', '-DANDROID_PLATFORM=android-29'
+            }
+        }
+    }
+
+    sourceSets {
+        main {
+            def sdlJava = file('../../toolchain/deps-android/sdl-java')
+            if (sdlJava.exists()) {
+                java.srcDirs += [sdlJava]
+            }
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // Extract lib*.so to nativeLibraryDir with 0755 so posix_spawn can launch libxc2_xlate.so.
+            useLegacyPackaging = true
+            // Preserve the .NET single-file bundle appended to libxc2_xlate.so and its Bionic runtime libs.
+            keepDebugSymbols += ['**/libxc2_xlate.so', '**/libhostfxr.so', '**/libhostpolicy.so', '**/libcoreclr.so', '**/libSystem.*.so', '**/libvulkan_turnip.so', '**/libadrenotools.so', '**/lib*hook*.so']
+        }
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+            jniDebuggable true
+            packaging {
+                jniLibs {
+                    keepDebugSymbols += ['**/*.so']
+                }
+            }
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    // When `tools/build_game.py --target android-arm64` + `tools/package_android.py` already staged
+    // `src/main/jniLibs/arm64-v8a/libmain.so`, skip redundant CMake recompilation unless `-PbuildNative=true` is passed.
+    def prebuiltMain = file('src/main/jniLibs/arm64-v8a/libmain.so')
+    if (!prebuiltMain.exists() || project.hasProperty('buildNative')) {
+        externalNativeBuild {
+            cmake {
+                path file('src/main/cpp/CMakeLists.txt')
+                version '3.22.1'
+            }
+        }
+    }
+
+    // Java 1.8 uses android.jar directly via -bootclasspath instead of AGP's JdkImageTransform (jlink), which breaks
+    // on newer Homebrew OpenJDK releases (JDK 24+).
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}

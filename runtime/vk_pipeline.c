@@ -154,13 +154,9 @@ static void cache_path_init(void) {
         return;
     }
     P.cache_path[0] = 0;
-    char exe[PLAT_PATH_MAX * 2];
-    int n = plat_exe_path(exe, sizeof exe);
-    if (!n || n >= sizeof exe) return;
-    char *cut = plat_last_sep(exe);
-    if (!cut) return;
-    *cut = 0;
-    snprintf(P.cache_path, sizeof P.cache_path, "%s/pipeline-cache.bin", exe);
+    char dir[PLAT_PATH_MAX * 2];
+    if (!plat_data_dir(dir, sizeof dir)) return;
+    snprintf(P.cache_path, sizeof P.cache_path, "%s/pipeline-cache.bin", dir);
 }
 
 // Intel's Windows driver (igvk64.dll, Iris Xe) faults in vkGetPipelineCacheData while another thread builds a

@@ -20,6 +20,26 @@
 // (a blit, for UI extraction only).
 #include "vk.h"
 
+#ifdef __ANDROID__
+// Desktop AMD FSR Frame Generation SDK is disabled on Android; pass swapchain operations straight to Vulkan.
+int vk_fg_wanted(void) { return 0; }
+int vk_fg_active(void) { return 0; }
+float vk_fg_shown_fps(uint64_t now_ns) { (void)now_ns; return -1.0f; }
+int vk_fg_swapchain(VkCtx *c, VkSwapchainCreateInfoKHR *ci, VkSwapchainKHR *sc) { (void)c, (void)ci, (void)sc; return 0; }
+VkResult vk_fg_images(VkDevice d, VkSwapchainKHR sc, uint32_t *n, VkImage *imgs) { return vkGetSwapchainImagesKHR(d, sc, n, imgs); }
+VkResult vk_fg_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, VkFence fence, uint32_t *idx) {
+    return vkAcquireNextImageKHR(d, sc, timeout, sem, fence, idx);
+}
+VkResult vk_fg_present(VkQueue q, const VkPresentInfoKHR *pi) { return vkQueuePresentKHR(q, pi); }
+int vk_fg_frame(VkCtx *c, VkCommandBuffer cb, const VkFsrFrame *fr, const int rect[4]) {
+    (void)c, (void)cb, (void)fr, (void)rect;
+    return 0;
+}
+void vk_fg_shutdown(VkCtx *c) { (void)c; }
+void vk_fg_release(VkCtx *c) { (void)c; }
+
+#else
+
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -555,3 +575,5 @@ void vk_fg_release(VkCtx *c) {
     if (G.tried) vk_fg_shutdown(c);
     memset(&G, 0, sizeof G);
 }
+
+#endif // __ANDROID__

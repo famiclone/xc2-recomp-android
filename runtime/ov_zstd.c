@@ -19,6 +19,7 @@
 #include <zstd.h>
 
 #include "cfg.h"
+#include "dispatch.h"
 #include "host.h"
 
 #if __has_include("patches.h")
@@ -28,8 +29,8 @@
 
 #ifdef RT_PATCH_PAGE
 
-#define GUEST_MULTIFRAME 0x700003a1f0ull   // 1.4.3 main: ZSTD_decompressMultiFrame (only 1.4.3 has the patch sites)
-#define GUEST_USING_DDICT 0x700003a1e0ull  // ZSTD_decompress_usingDDict
+#define GUEST_MULTIFRAME (RT_MAIN_BASE + 0x3a1f0ull)   // 1.4.3 main: ZSTD_decompressMultiFrame (only 1.4.3 has the patch sites)
+#define GUEST_USING_DDICT (RT_MAIN_BASE + 0x3a1e0ull)  // ZSTD_decompress_usingDDict
 #define HOST_MULTIFRAME (RT_PATCH_PAGE + 0xff0)
 #define HOST_USING_DDICT (RT_PATCH_PAGE + 0xfe0)
 #define AWAY_BYTES (64u << 10)

@@ -25,7 +25,6 @@
 // periods late is dropped if the next one is due too, so the picture keeps time with the movie's sound.
 // XC2_MOVIE_PACE=0 hands every decoded frame over at the next present; XC2_MOVIE_HOST=0 leaves every decoder to the
 // library (which aborts at the first movie).
-#include <emmintrin.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +36,7 @@
 #include "host.h"
 #include "movie.h"
 #include "platform/platform.h"
+#include "simd_platform.h"
 
 enum { IN_BUFS = 4, IN_CAP = 2 << 20, OUT_BUFS = 8, MAX_MOVIES = 16, VPX_THREADS = 4 };
 enum { ST_OK = 0, ST_ERROR = 0x1000, ST_NULL = 0x100b, ST_NO_OUTPUT = 0x100e, ST_NO_INPUT = 0x1011,
@@ -198,9 +198,14 @@ static void to_nv12(const vpx_image_t *img, uint8_t *dst, int w, int h) {
         uint8_t *o = uv + (size_t)y * w;
         int x = 0;
         for (; x + 16 <= cw; x += 16) {
+#if defined(__aarch64__)
+            uint8x16x2_t uv16 = {{vld1q_u8(u + x), vld1q_u8(v + x)}};
+            vst2q_u8(o + 2 * x, uv16);
+#else
             __m128i a = _mm_loadu_si128((const __m128i *)(u + x)), b = _mm_loadu_si128((const __m128i *)(v + x));
             _mm_storeu_si128((__m128i *)(o + 2 * x), _mm_unpacklo_epi8(a, b));
             _mm_storeu_si128((__m128i *)(o + 2 * x + 16), _mm_unpackhi_epi8(a, b));
+#endif
         }
         for (; x < cw; x++) {
             o[2 * x] = u[x];

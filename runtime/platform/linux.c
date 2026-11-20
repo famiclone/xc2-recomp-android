@@ -8,7 +8,11 @@
 #include <limits.h>
 #include <linux/fs.h>
 #include <linux/futex.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#else
 #include <linux/userfaultfd.h>
+#endif
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -80,8 +84,11 @@ struct PlatThread {
     pthread_t t;
     PlatThreadFn fn;
     void *arg;
-    volatile int32_t tid;   // the kernel's id once the thread runs, for plat_thread_set_priority
-    char name[16];          // the kernel keeps 15 characters
+    volatile int32_t tid;    // the kernel's id once the thread runs, for plat_thread_set_priority
+#ifdef __ANDROID__
+    volatile uint32_t done;  // futex-woken on exit: Bionic has no pthread_timedjoin_np
+#endif
+    char name[16];           // the kernel keeps 15 characters
 };
 
 // A signal stack for the calling thread, so the fault and crash handlers still run when its own stack is exhausted.
@@ -96,12 +103,124 @@ static void alt_stack(void) {
     sigaltstack(&ss, NULL);
 }
 
+static int read_u64_file(const char *path, uint64_t *v);
+
+#ifdef __ANDROID__
+__attribute__((weak)) const char *cfg_get(const char *name);
+
+// Classify heterogeneous ARM64 big.LITTLE clusters (e.g. Snapdragon 8 Gen 2 1+4+3: cpu0..2 Cortex-A510 Silver @ 2.02 GHz,
+// cpu3..6 Cortex-A710/A715 Gold @ 2.80 GHz, cpu7 Cortex-X3 Prime @ 3.20+ GHz) into Silver efficiency and Gold+Prime masks.
+static void classify_android_clusters(const uint64_t freqs[64], uint64_t avail, uint64_t *eff_out, uint64_t *perf_out) {
+    uint64_t min_f = UINT64_MAX, max_f = 0;
+    int n_cpus = 0;
+    for (int i = 0; i < 64; i++) {
+        if (!(avail >> i & 1)) continue;
+        n_cpus++;
+        if (freqs[i]) {
+            if (freqs[i] < min_f) min_f = freqs[i];
+            if (freqs[i] > max_f) max_f = freqs[i];
+        }
+    }
+    if (max_f > min_f && min_f < UINT64_MAX) {
+        uint64_t eff = 0, perf = 0;
+        for (int i = 0; i < 64; i++) {
+            if (!(avail >> i & 1)) continue;
+            if (freqs[i] && freqs[i] <= min_f) eff |= 1ull << i;
+            else perf |= 1ull << i;
+        }
+        if (eff && perf) {
+            *eff_out = eff;
+            *perf_out = perf;
+            return;
+        }
+    }
+    // Fallback when cpufreq/topology sysfs is hidden on an 8-core Snapdragon 8 Gen 2 (1+4+3: cpu0..2 Silver, cpu3..7 Gold/Prime).
+    if (n_cpus == 8 && (avail & 0xffull) == 0xffull) {
+        *eff_out = 0x07ull;
+        *perf_out = 0xf8ull;
+        return;
+    }
+    *eff_out = *perf_out = 0;
+}
+
+static pthread_once_t g_android_pin_once = PTHREAD_ONCE_INIT;
+static uint64_t g_android_eff_mask, g_android_perf_mask;
+static int g_android_pin_on;
+
+static void init_android_clusters(void) {
+    const char *v = cfg_get ? cfg_get("XC2_ANDROID_PIN") : NULL;
+    if (!v) v = getenv("XC2_ANDROID_PIN");
+    g_android_pin_on = !v || !*v || strcmp(v, "0") != 0;
+    if (!g_android_pin_on) return;
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) != 0) return;
+    uint64_t avail = 0, freqs[64] = {0};
+    int any_freq = 0;
+    for (int i = 0; i < 64; i++) {
+        if (!CPU_ISSET(i, &set)) continue;
+        avail |= 1ull << i;
+        char path[128];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+        if (read_u64_file(path, &freqs[i]) && freqs[i]) any_freq = 1;
+    }
+    if (!any_freq) {
+        for (int i = 0; i < 64; i++) {
+            if (!(avail >> i & 1)) continue;
+            char path[128];
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/cpu_capacity", i);
+            read_u64_file(path, &freqs[i]);
+        }
+    }
+    classify_android_clusters(freqs, avail, &g_android_eff_mask, &g_android_perf_mask);
+}
+
+static uint64_t android_role_mask(const char *name) {
+    if (!name || !*name) return 0;
+    // Performance-critical threads: main guest loop, Horizon guest threads, and Vulkan replay/present/completion/vsync.
+    static const char *const perf_names[] = {
+        "xc2 main", "guest main", "guest", "vk replay", "vk present", "vk completion", "vsync"
+    };
+    for (size_t i = 0; i < sizeof perf_names / sizeof *perf_names; i++)
+        if (!strcmp(name, perf_names[i])) return g_android_perf_mask;
+
+    // Background audio, video, decompression, pipeline workers, and telemetry threads -> Silver efficiency cores.
+    static const char *const eff_names[] = {
+        "audren", "movie", "astc", "save commit", "use preload", "pipe autosave",
+        "pipe worker", "lib prebuild", "vk headroom", "motion", "perfmon", "reap", "flight dump"
+    };
+    for (size_t i = 0; i < sizeof eff_names / sizeof *eff_names; i++)
+        if (!strcmp(name, eff_names[i])) return g_android_eff_mask;
+    return 0;
+}
+
+static void android_pin_self(const char *name) {
+    pthread_once(&g_android_pin_once, init_android_clusters);
+    if (!g_android_pin_on) return;
+    uint64_t mask = android_role_mask(name);
+    if (!mask) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int i = 0; i < 64; i++)
+        if (mask >> i & 1) CPU_SET(i, &set);
+    sched_setaffinity(0, sizeof set, &set);
+}
+#endif
+
 static void *thread_main(void *p) {
     PlatThread *t = p;
     alt_stack();
     __atomic_store_n(&t->tid, (int32_t)syscall(SYS_gettid), __ATOMIC_RELEASE);
     if (t->name[0]) pthread_setname_np(pthread_self(), t->name);
+#ifdef __ANDROID__
+    android_pin_self(t->name);
+#endif
     t->fn(t->arg);
+#ifdef __ANDROID__
+    __atomic_store_n(&t->done, 1, __ATOMIC_RELEASE);
+    syscall(SYS_futex, &t->done, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, 0);
+#endif
     return NULL;
 }
 
@@ -124,8 +243,6 @@ PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, siz
     if (e) { free(t); return NULL; }
     return t;
 }
-
-static int read_u64_file(const char *path, uint64_t *v);
 
 // The physical core of each logical processor is in /sys/devices/system/cpu/cpu<n>/topology/core_id together with its
 // package; the lowest-numbered processor of each (package, core) pair is the core's first.
@@ -202,13 +319,30 @@ static void intr_handler(int sig, siginfo_t *si, void *uc) {
     PlatIntr *t = intr_me;
     ucontext_t *u = uc;
     if (!t) return;
+#if defined(__aarch64__)
+    t->rip = (uint64_t)u->uc_mcontext.pc;
+    t->rsp = (uint64_t)u->uc_mcontext.sp;
+#else
     t->rip = (uint64_t)u->uc_mcontext.gregs[REG_RIP];
     t->rsp = (uint64_t)u->uc_mcontext.gregs[REG_RSP];
+#endif
     int32_t req = INTR_REQ;
     if (!__atomic_compare_exchange_n(&t->state, &req, INTR_STOPPED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
     while (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != INTR_GO) plat_pause();
-    if (t->to) u->uc_mcontext.gregs[REG_RIP] = (greg_t)t->to;
+    uint64_t to = t->to;
+    t->to = 0;
+#if defined(__aarch64__)
+    if (to) {
+        uint64_t fpcr;
+        __asm__ volatile("mrs %0, fpcr\n\tmsr fpcr, xzr" : "=r"(fpcr));
+        ((void (*)(void))(uintptr_t)to)();
+        __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+    }
     __atomic_store_n(&t->state, INTR_IDLE, __ATOMIC_RELEASE);
+#else
+    if (to) u->uc_mcontext.gregs[REG_RIP] = (greg_t)to;
+    __atomic_store_n(&t->state, INTR_IDLE, __ATOMIC_RELEASE);
+#endif
 }
 
 PlatIntr *plat_intr_self(void) {
@@ -277,6 +411,58 @@ struct PlatFiber {
 
 void plat_fiber_swap(void **save, void *load);
 void plat_fiber_entry(void);
+#if defined(__aarch64__)
+__asm__(".text\n"
+        ".globl plat_fiber_swap\n"
+        ".type plat_fiber_swap, @function\n"
+        ".p2align 4\n"
+        "plat_fiber_swap:\n"
+        "    .cfi_startproc\n"
+        "    sub sp, sp, #176\n"
+        "    mrs x2, fpcr\n"
+        "    mrs x3, fpsr\n"
+        "    stp x2,  x3,  [sp, #0]\n"
+        "    stp d8,  d9,  [sp, #16]\n"
+        "    stp d10, d11, [sp, #32]\n"
+        "    stp d12, d13, [sp, #48]\n"
+        "    stp d14, d15, [sp, #64]\n"
+        "    stp x19, x20, [sp, #80]\n"
+        "    stp x21, x22, [sp, #96]\n"
+        "    stp x23, x24, [sp, #112]\n"
+        "    stp x25, x26, [sp, #128]\n"
+        "    stp x27, x28, [sp, #144]\n"
+        "    stp x29, x30, [sp, #160]\n"
+        "    mov x2, sp\n"
+        "    str x2, [x0]\n"
+        "    mov sp, x1\n"
+        "    ldp x2,  x3,  [sp, #0]\n"
+        "    msr fpcr, x2\n"
+        "    msr fpsr, x3\n"
+        "    ldp d8,  d9,  [sp, #16]\n"
+        "    ldp d10, d11, [sp, #32]\n"
+        "    ldp d12, d13, [sp, #48]\n"
+        "    ldp d14, d15, [sp, #64]\n"
+        "    ldp x19, x20, [sp, #80]\n"
+        "    ldp x21, x22, [sp, #96]\n"
+        "    ldp x23, x24, [sp, #112]\n"
+        "    ldp x25, x26, [sp, #128]\n"
+        "    ldp x27, x28, [sp, #144]\n"
+        "    ldp x29, x30, [sp, #160]\n"
+        "    add sp, sp, #176\n"
+        "    ret\n"
+        "    .cfi_endproc\n"
+        ".size plat_fiber_swap, .-plat_fiber_swap\n"
+        ".globl plat_fiber_entry\n"
+        ".type plat_fiber_entry, @function\n"
+        ".p2align 4\n"
+        "plat_fiber_entry:\n"
+        "    mov x29, #0\n"
+        "    mov x30, #0\n"
+        "    mov x0, x20\n"
+        "    blr x19\n"
+        "    brk #1\n"
+        ".size plat_fiber_entry, .-plat_fiber_entry\n");
+#else
 __asm__(".text\n"
         ".globl plat_fiber_swap\n"
         ".type plat_fiber_swap, @function\n"
@@ -314,6 +500,7 @@ __asm__(".text\n"
         "    callq *%r12\n"
         "    ud2\n"
         ".size plat_fiber_entry, .-plat_fiber_entry\n");
+#endif
 
 static __thread PlatFiber *fiber_cur;
 static __thread PlatFiber fiber_own;
@@ -325,6 +512,10 @@ PlatFiber *plat_fiber_self(void) {
 }
 
 void plat_fiber_unself(void) { fiber_cur = NULL; }
+
+#ifndef MAP_STACK
+#define MAP_STACK 0
+#endif
 
 PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
     PlatFiber *f = calloc(1, sizeof *f);
@@ -338,6 +529,14 @@ PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
     mprotect(m, 4096, PROT_NONE);
     f->stack = m, f->size = stack;
     uint64_t *top = (uint64_t *)(((uintptr_t)m + stack) & ~(uintptr_t)15);
+#if defined(__aarch64__)
+    // 22 words (176 bytes): fpcr, fpsr, d8-d15, x19-x28, x29, x30 (plat_fiber_entry); SP is 16-aligned after pop.
+    uint64_t *sp = top - 22;
+    memset(sp, 0, 22 * sizeof *sp);
+    sp[10] = (uint64_t)(uintptr_t)fn;    // x19
+    sp[11] = (uint64_t)(uintptr_t)arg;   // x20
+    sp[21] = (uint64_t)(uintptr_t)plat_fiber_entry;   // x30 (LR)
+#else
     // fiber_entry starts with the stack pointer 16-aligned as its call needs, so fn enters as the ABI says: code the
     // compiler built for an aligned stack (vmovaps on a stack slot) faults otherwise.
     uint64_t *sp = top - 11;   // fpu state (2 words), r15, r14, r13, r12, rbx, rbp, return address, 2 words of padding
@@ -349,6 +548,7 @@ PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
     sp[6] = sp[7] = 0;         // rbx, rbp
     sp[8] = (uint64_t)(uintptr_t)plat_fiber_entry;
     sp[9] = sp[10] = 0;
+#endif
     f->sp = sp;
     return f;
 }
@@ -377,6 +577,20 @@ void plat_thread_join(PlatThread *t) {
 }
 
 int plat_thread_join_ns(PlatThread *t, uint64_t ns) {
+#ifdef __ANDROID__
+    uint64_t deadline = plat_now_ns() + ns;
+    while (!__atomic_load_n(&t->done, __ATOMIC_ACQUIRE)) {
+        uint64_t now = plat_now_ns();
+        if (now >= deadline) return 0;
+        uint64_t rem = deadline - now;
+        struct timespec ts = {(time_t)(rem / 1000000000u), (long)(rem % 1000000000u)};
+        long r = syscall(SYS_futex, &t->done, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, &ts, NULL, 0);
+        if (r == -1 && errno == ETIMEDOUT && !__atomic_load_n(&t->done, __ATOMIC_ACQUIRE)) return 0;
+    }
+    pthread_join(t->t, NULL);
+    free(t);
+    return 1;
+#else
     struct timespec at;
     clock_gettime(CLOCK_REALTIME, &at);   // pthread_timedjoin_np takes a CLOCK_REALTIME deadline
     uint64_t end = (uint64_t)at.tv_sec * 1000000000u + (uint64_t)at.tv_nsec + ns;
@@ -384,19 +598,29 @@ int plat_thread_join_ns(PlatThread *t, uint64_t ns) {
     if (pthread_timedjoin_np(t->t, NULL, &at)) return 0;
     free(t);
     return 1;
+#endif
 }
 
 // The thread keeps using t->fn and t->arg, so the struct stays allocated (a few bytes per detached thread).
 void plat_thread_detach(PlatThread *t) { pthread_detach(t->t); }
 
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
-    pthread_t th = t ? t->t : pthread_self();
     cpu_set_t old, set;
+#ifdef __ANDROID__
+    pid_t tid = t ? pthread_gettid_np(t->t) : 0;
+    if (tid < 0 || sched_getaffinity(tid, sizeof old, &old)) return 0;
+    CPU_ZERO(&set);
+    for (int i = 0; i < 64; i++)
+        if (mask >> i & 1) CPU_SET(i, &set);
+    if (sched_setaffinity(tid, sizeof set, &set)) return 0;
+#else
+    pthread_t th = t ? t->t : pthread_self();
     if (pthread_getaffinity_np(th, sizeof old, &old)) return 0;
     CPU_ZERO(&set);
     for (int i = 0; i < 64; i++)
         if (mask >> i & 1) CPU_SET(i, &set);
     if (pthread_setaffinity_np(th, sizeof set, &set)) return 0;
+#endif
     uint64_t prev = 0;
     for (int i = 0; i < 64; i++)
         if (CPU_ISSET(i, &old)) prev |= 1ull << i;
@@ -726,21 +950,39 @@ int plat_file_replace(const char *from, const char *to) {
 }
 
 int plat_file_write_atomic(const char *path, const void *data, size_t n) {
+#ifndef __ANDROID__
     // A rename replaces a read-only file here (only the folder's permission counts) but not on Windows: a file the
     // player made read-only stays as it is on both.
     if (access(path, W_OK) && errno != ENOENT) return 0;
+#endif
     char tmp[PATH_MAX + 48];
     int len = snprintf(tmp, sizeof tmp, "%s.%u.%u.tmp", path, plat_process_id(), plat_thread_id());
     if (len < 0 || len >= (int)sizeof tmp) return 0;
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) return 0;
+    if (fd < 0) {
+#ifdef __ANDROID__
+        return plat_file_write(path, data, n);
+#else
+        return 0;
+#endif
+    }
     int ok = write_all(fd, data, n) && fsync(fd) == 0;
     ok = close(fd) == 0 && ok;
     if (ok && !rename(tmp, path)) {
         sync_dir_of(path);
         return 1;
     }
+#ifdef __ANDROID__
+    // Android Scoped Storage FUSE rejects rename() over a file pushed via adb (shell UID); unlink + rename succeeds.
+    if (ok && !unlink(path) && !rename(tmp, path)) {
+        sync_dir_of(path);
+        return 1;
+    }
+#endif
     unlink(tmp);
+#ifdef __ANDROID__
+    if (ok) return plat_file_write(path, data, n);
+#endif
     return 0;
 }
 
@@ -796,6 +1038,18 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
 #define PG 4096ull
 #define PS_LIMIT (1ull << 39)
 enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are committed: PLAT_PROT_* + PS_NONE
+#ifdef __ANDROID__
+// Android SELinux blocks userfaultfd on unprivileged app processes, so watched reservations track dirty 4 KiB pages
+// with soft PROT_READ protection + lock-free atomic flags in pstate, disarmed in fault_handler on first write and in
+// plat_mem_disarm before kernel pread() / mremap().
+#define PS_MASK 0x07u
+#define PS_NOWATCH 0x10u
+#define PS_ARMED 0x20u
+#define PS_WATCHED 0x40u
+#define PS_DIRTY 0x80u
+#else
+#define PS_MASK 0xffu
+#endif
 static uint8_t *pstate;
 static int ww_fd = -1, pm_fd = -1;   // userfaultfd and /proc/self/pagemap; -1 when write watch is unavailable
 static PlatMutex vm_lock = PLAT_MUTEX_INIT;
@@ -805,6 +1059,9 @@ static void ps_set(uint64_t addr, uint64_t n, uint8_t v) {
 }
 
 static void ww_open(void) {
+#ifdef __ANDROID__
+    return;
+#else
     int fd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
     struct uffdio_api api = {.api = UFFD_API,
                              .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED};
@@ -820,6 +1077,7 @@ static void ww_open(void) {
         return;
     }
     ww_fd = fd;
+#endif
 }
 
 int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
@@ -836,14 +1094,20 @@ int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
     int ok = p == (void *)(uintptr_t)addr;
     if (p != MAP_FAILED && !ok) munmap(p, n);   // a kernel without MAP_FIXED_NOREPLACE put it elsewhere
     if (ok) {
+#ifdef __ANDROID__
+        ps_set(addr, n, (uint8_t)(PS_RESERVED | (watch ? PS_WATCHED : 0)));
+#else
         ps_set(addr, n, PS_RESERVED);
+#endif
         // Transparent huge pages would populate (and count as written) 2 MiB at the first write of one page; writes are
         // tracked per 4 KiB page, as on Windows.
         if (watch) madvise(p, n, MADV_NOHUGEPAGE);
+#ifndef __ANDROID__
         struct uffdio_register reg = {.range = {addr, n}, .mode = UFFDIO_REGISTER_MODE_WP};
         if (watch && ww_fd >= 0 && ioctl(ww_fd, UFFDIO_REGISTER, &reg))
             fprintf(stderr, "platform: write watch over %#llx+%#llx failed (%s)\n", (unsigned long long)addr,
                     (unsigned long long)n, strerror(errno));
+#endif
     }
     plat_mutex_unlock(&vm_lock);
     return ok;
@@ -855,6 +1119,23 @@ void *plat_mem_alloc(size_t n) {
 }
 
 int plat_mem_commit(uint64_t addr, size_t n) {
+#ifdef __ANDROID__
+    if (pstate && addr < PS_LIMIT && (__atomic_load_n(&pstate[addr / PG], __ATOMIC_RELAXED) & PS_WATCHED)) {
+        if (mprotect((void *)(uintptr_t)addr, n, PROT_READ) == 0) {
+            uint64_t p0 = addr / PG, p1 = (addr + n + PG - 1) / PG;
+            if (p1 > PS_LIMIT / PG) p1 = PS_LIMIT / PG;
+            for (uint64_t i = p0; i < p1; i++)
+                __atomic_store_n(&pstate[i], PS_RW | PS_WATCHED | PS_ARMED, __ATOMIC_RELEASE);
+            return 1;
+        }
+        if (mprotect((void *)(uintptr_t)addr, n, PROT_READ | PROT_WRITE)) return 0;
+        uint64_t p0 = addr / PG, p1 = (addr + n + PG - 1) / PG;
+        if (p1 > PS_LIMIT / PG) p1 = PS_LIMIT / PG;
+        for (uint64_t i = p0; i < p1; i++)
+            __atomic_store_n(&pstate[i], PS_RW | PS_WATCHED | PS_NOWATCH, __ATOMIC_RELEASE);
+        return 1;
+    }
+#endif
     if (mprotect((void *)(uintptr_t)addr, n, PROT_READ | PROT_WRITE)) return 0;
     ps_set(addr, n, PS_RW);
     return 1;
@@ -862,11 +1143,45 @@ int plat_mem_commit(uint64_t addr, size_t n) {
 
 int plat_mem_decommit(uint64_t addr, uint64_t n) {
     if (madvise((void *)(uintptr_t)addr, n, MADV_DONTNEED) || mprotect((void *)(uintptr_t)addr, n, PROT_NONE)) return 0;
+#ifdef __ANDROID__
+    if (pstate && addr < PS_LIMIT) {
+        uint64_t p0 = addr / PG, p1 = (addr + n + PG - 1) / PG;
+        if (p1 > PS_LIMIT / PG) p1 = PS_LIMIT / PG;
+        for (uint64_t i = p0; i < p1; i++) {
+            uint8_t w = __atomic_load_n(&pstate[i], __ATOMIC_RELAXED) & PS_WATCHED;
+            __atomic_store_n(&pstate[i], (uint8_t)(PS_RESERVED | w), __ATOMIC_RELEASE);
+        }
+        return 1;
+    }
+#endif
     ps_set(addr, n, PS_RESERVED);
     return 1;
 }
 
 int plat_mem_protect(uint64_t addr, uint64_t n, int prot) {
+#ifdef __ANDROID__
+    if (pstate && addr < PS_LIMIT && (__atomic_load_n(&pstate[addr / PG], __ATOMIC_RELAXED) & PS_WATCHED)) {
+        uint64_t p0 = addr / PG, p1 = (addr + n + PG - 1) / PG;
+        if (p1 > PS_LIMIT / PG) p1 = PS_LIMIT / PG;
+        if (prot == PLAT_PROT_RW) {
+            int armed_ok = mprotect((void *)(uintptr_t)addr, n, PROT_READ) == 0;
+            if (!armed_ok && mprotect((void *)(uintptr_t)addr, n, PROT_READ | PROT_WRITE)) return 0;
+            for (uint64_t i = p0; i < p1; i++) {
+                uint8_t keep = __atomic_load_n(&pstate[i], __ATOMIC_RELAXED) & (PS_WATCHED | PS_DIRTY | PS_NOWATCH);
+                uint8_t arm = armed_ok && !(keep & PS_NOWATCH) ? PS_ARMED : PS_NOWATCH;
+                __atomic_store_n(&pstate[i], (uint8_t)(PS_RW | keep | arm), __ATOMIC_RELEASE);
+            }
+            return 1;
+        }
+        int p = prot == PLAT_PROT_READ ? PROT_READ : PROT_NONE;
+        if (mprotect((void *)(uintptr_t)addr, n, p)) return 0;
+        for (uint64_t i = p0; i < p1; i++) {
+            uint8_t keep = __atomic_load_n(&pstate[i], __ATOMIC_RELAXED) & (PS_WATCHED | PS_DIRTY | PS_NOWATCH);
+            __atomic_store_n(&pstate[i], (uint8_t)((PS_NONE + prot) | keep), __ATOMIC_RELEASE);
+        }
+        return 1;
+    }
+#endif
     int p = prot == PLAT_PROT_RW ? PROT_READ | PROT_WRITE : prot == PLAT_PROT_READ ? PROT_READ : PROT_NONE;
     if (mprotect((void *)(uintptr_t)addr, n, p)) return 0;
     ps_set(addr, n, (uint8_t)(PS_NONE + prot));
@@ -879,14 +1194,106 @@ int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end) {
         return PLAT_MEM_FREE;
     }
     uint64_t lim = limit < PS_LIMIT ? limit : PS_LIMIT, i = addr / PG;
-    uint8_t v = pstate[i];
-    while ((i + 1) * PG < lim && pstate[i + 1] == v) i++;
+    uint8_t v = pstate[i] & PS_MASK;
+    while ((i + 1) * PG < lim && (pstate[i + 1] & PS_MASK) == v) i++;
     *end = (i + 1) * PG < lim ? (i + 1) * PG : lim;
     return v == PS_FREE ? PLAT_MEM_FREE : v == PS_RESERVED ? PLAT_MEM_RESERVED : v - PS_NONE;
 }
 
+#ifdef __ANDROID__
+void plat_mem_disarm(uint64_t addr, uint64_t n) {
+    if (!n || !pstate || addr >= PS_LIMIT) return;
+    uint64_t lo = addr & ~(PG - 1);
+    uint64_t hi = addr + n > PS_LIMIT ? PS_LIMIT : (addr + n + PG - 1) & ~(PG - 1);
+    uint64_t run_lo = UINT64_MAX;
+    for (uint64_t a = lo; a < hi; a += PG) {
+        uint64_t i = a / PG;
+        uint8_t v = __atomic_load_n(&pstate[i], __ATOMIC_ACQUIRE);
+        if ((v & (PS_MASK | PS_WATCHED)) == (PS_RW | PS_WATCHED)) {
+            int was_armed = (v & PS_ARMED) != 0;
+            while ((v & (PS_MASK | PS_WATCHED)) == (PS_RW | PS_WATCHED) &&
+                   ((v & PS_ARMED) || !(v & PS_DIRTY))) {
+                was_armed |= (v & PS_ARMED) != 0;
+                uint8_t nv = (uint8_t)((v & ~PS_ARMED) | PS_DIRTY);
+                if (__atomic_compare_exchange_n(&pstate[i], &v, nv, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
+            }
+            if (was_armed) {
+                if (run_lo == UINT64_MAX) run_lo = a;
+                continue;
+            }
+        }
+        if (run_lo != UINT64_MAX) {
+            mprotect((void *)(uintptr_t)run_lo, (size_t)(a - run_lo), PROT_READ | PROT_WRITE);
+            run_lo = UINT64_MAX;
+        }
+    }
+    if (run_lo != UINT64_MAX)
+        mprotect((void *)(uintptr_t)run_lo, (size_t)(hi - run_lo), PROT_READ | PROT_WRITE);
+}
+
+static int arm_flush(uint64_t run_lo, uint64_t run_hi) {
+    if (run_lo == UINT64_MAX) return 1;
+    if (mprotect((void *)(uintptr_t)run_lo, (size_t)(run_hi - run_lo), PROT_READ) == 0) return 1;
+    for (uint64_t a = run_lo; a < run_hi; a += PG)
+        __atomic_fetch_and(&pstate[a / PG], (uint8_t)~PS_ARMED, __ATOMIC_ACQ_REL),
+            __atomic_fetch_or(&pstate[a / PG], PS_NOWATCH, __ATOMIC_ACQ_REL);
+    return 0;
+}
+#endif
+
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
     if (!max || !n) return 0;
+#ifdef __ANDROID__
+    if (!pstate || addr >= PS_LIMIT || n > PS_LIMIT - addr) return UINT64_MAX;
+    uint64_t p0 = addr / PG, p1 = (addr + n + PG - 1) / PG;
+    uint64_t got = 0, run_lo = UINT64_MAX, run_hi = 0;
+    for (uint64_t i = p0; i < p1 && got < max;) {
+        if ((i & 7) == 0 && i + 8 <= p1) {
+            uint64_t w;
+            memcpy(&w, &pstate[i], 8);
+            const uint64_t watched8 = 0x4040404040404040ull;
+            const uint64_t dirty_or_nowatch8 = 0x9090909090909090ull;
+            if ((w & watched8) == watched8 && !(w & dirty_or_nowatch8)) {
+                if (run_lo != UINT64_MAX) {
+                    if (!arm_flush(run_lo, run_hi)) return UINT64_MAX;
+                    run_lo = UINT64_MAX;
+                }
+                i += 8;
+                continue;
+            }
+        }
+        uint8_t v = __atomic_load_n(&pstate[i], __ATOMIC_ACQUIRE);
+        if (!(v & PS_WATCHED) || (v & PS_NOWATCH)) {
+            arm_flush(run_lo, run_hi);
+            return UINT64_MAX;
+        }
+        int need_mprotect = 0;
+        if (v & PS_DIRTY) {
+            pages[got++] = i * PG;
+            if (reset) {
+                while (v & PS_DIRTY) {
+                    int can_arm = (v & PS_MASK) == PS_RW && !(v & PS_NOWATCH);
+                    uint8_t nv = (uint8_t)((v & ~PS_DIRTY) | (can_arm ? PS_ARMED : 0));
+                    int was_armed = (v & PS_ARMED) != 0;
+                    if (__atomic_compare_exchange_n(&pstate[i], &v, nv, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                        need_mprotect = can_arm && !was_armed;
+                        break;
+                    }
+                }
+            }
+        }
+        if (need_mprotect) {
+            if (run_lo == UINT64_MAX) run_lo = i * PG;
+            run_hi = (i + 1) * PG;
+        } else if (run_lo != UINT64_MAX) {
+            if (!arm_flush(run_lo, run_hi)) return UINT64_MAX;
+            run_lo = UINT64_MAX;
+        }
+        i++;
+    }
+    if (!arm_flush(run_lo, run_hi)) return UINT64_MAX;
+    return got;
+#else
     if (ww_fd < 0) return UINT64_MAX;
     struct page_region r[256];
     uint64_t got = 0;
@@ -910,6 +1317,7 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
         at = arg.walk_end;
     }
     return got;
+#endif
 }
 
 // One handler for the synchronous faults. A SIGSEGV whose page-fault error code has the write bit set goes to the
@@ -918,18 +1326,69 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 static int (*fault_hook)(uint64_t addr);
 static void (*crash_fn)(const PlatCrash *c);
 
+#if defined(__aarch64__)
+// Walks ucontext's __reserved extension records for ESR_EL1 (ESR_MAGIC 0x45535201): WnR is bit 6, EC is bits 31..26
+// (0x20/0x21 = instruction abort).
+static void arm64_fault_access(const ucontext_t *u, int *is_write, int *is_exec) {
+    *is_write = *is_exec = 0;
+    const uint8_t *buf = u->uc_mcontext.__reserved;
+    size_t cap = sizeof u->uc_mcontext.__reserved, off = 0;
+    while (off + 8 <= cap) {
+        uint32_t magic, size;
+        memcpy(&magic, buf + off, 4);
+        memcpy(&size, buf + off + 4, 4);
+        if (!magic || size < 8 || (size & 15) || off + size > cap) break;
+        if (magic == 0x45535201u && size >= 16) {
+            uint64_t esr;
+            memcpy(&esr, buf + off + 8, 8);
+            uint32_t ec = (uint32_t)((esr >> 26) & 0x3fu);
+            *is_exec = (ec == 0x20u || ec == 0x21u);
+            *is_write = !*is_exec && ((esr & (1ull << 6)) != 0);
+            return;
+        }
+        off += size;
+    }
+}
+#endif
+
 static void fault_handler(int sig, siginfo_t *si, void *uc) {
     ucontext_t *u = uc;
+#if defined(__aarch64__)
+    int is_write = 0, is_exec = 0;
+    arm64_fault_access(u, &is_write, &is_exec);
+    uintptr_t rip = (uintptr_t)u->uc_mcontext.pc;
+#else
     long err = u->uc_mcontext.gregs[REG_ERR];
-    if (sig == SIGSEGV && fault_hook && (err & 2) && fault_hook((uint64_t)(uintptr_t)si->si_addr)) return;
+    int is_write = (err & 2) != 0, is_exec = (err & 16) != 0;
     uintptr_t rip = (uintptr_t)u->uc_mcontext.gregs[REG_RIP];
+#endif
+    if (sig == SIGSEGV && is_write) {
+#ifdef __ANDROID__
+        uint64_t a = (uint64_t)(uintptr_t)si->si_addr;
+        if (pstate && a < PS_LIMIT) {
+            uint64_t pg = a / PG, base = pg * PG;
+            uint8_t v = __atomic_load_n(&pstate[pg], __ATOMIC_ACQUIRE);
+            while ((v & (PS_MASK | PS_ARMED)) == (PS_RW | PS_ARMED)) {
+                uint8_t nv = (uint8_t)((v & ~PS_ARMED) | PS_DIRTY);
+                if (__atomic_compare_exchange_n(&pstate[pg], &v, nv, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                    if (mprotect((void *)(uintptr_t)base, PG, PROT_READ | PROT_WRITE) == 0) return;
+                    break;
+                }
+            }
+            if ((v & (PS_MASK | PS_WATCHED | PS_DIRTY)) == (PS_RW | PS_WATCHED | PS_DIRTY) &&
+                mprotect((void *)(uintptr_t)base, PG, PROT_READ | PROT_WRITE) == 0)
+                return;
+        }
+#endif
+        if (fault_hook && fault_hook((uint64_t)(uintptr_t)si->si_addr)) return;
+    }
     Dl_info at, self;
     if (crash_fn && dladdr((void *)rip, &at) && dladdr((void *)plat_crash_hook, &self) && at.dli_fbase == self.dli_fbase) {
         PlatCrash c = {sig == SIGSEGV ? "access violation" : sig == SIGBUS ? "bus error"
                        : sig == SIGILL ? "illegal instruction" : "arithmetic exception",
                        (uint32_t)sig, rip, rip - (uintptr_t)self.dli_fbase, -1, 0};
         if (sig == SIGSEGV || sig == SIGBUS)
-            c.access = (err & 16) ? 8 : (err & 2) ? 1 : 0, c.addr = (uint64_t)(uintptr_t)si->si_addr;
+            c.access = is_exec ? 8 : is_write ? 1 : 0, c.addr = (uint64_t)(uintptr_t)si->si_addr;
         crash_fn(&c);
     }
     signal(sig, SIG_DFL);   // returns into the faulting instruction, which faults again with the default action
@@ -1016,6 +1475,14 @@ int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
     ssize_t k;
     do k = pread(fd_of(f), buf, n, (off_t)off);
     while (k < 0 && errno == EINTR);
+#ifdef __ANDROID__
+    if (k < 0 && errno == EFAULT && n) {
+        plat_mem_disarm((uint64_t)(uintptr_t)buf, n);
+        do k = pread(fd_of(f), buf, n, (off_t)off);
+        while (k < 0 && errno == EINTR);
+    }
+    if (k > 0) plat_mem_disarm((uint64_t)(uintptr_t)buf, (uint64_t)k);
+#endif
     return k >= 0 ? k : errno == EFAULT ? -2 : -1;
 }
 
@@ -1162,6 +1629,29 @@ int plat_exe_path(char *out, size_t cap) {
     return 1;
 }
 
+int plat_data_dir(char *out, size_t cap) {
+#ifdef __ANDROID__
+    const char *env = getenv("XC2_DATA_DIR");
+    const char *cand = (env && *env) ? env
+                     : plat_dir_exists("/storage/emulated/0/Android/data/com.xc2recomp.app/files")
+                         ? "/storage/emulated/0/Android/data/com.xc2recomp.app/files"
+                         : "/sdcard/Android/data/com.xc2recomp.app/files";
+    size_t n = strlen(cand);
+    while (n > 1 && (cand[n - 1] == '/' || cand[n - 1] == '\\')) n--;
+    if (!n || n >= cap) return 0;
+    memcpy(out, cand, n);
+    out[n] = 0;
+    return 1;
+#else
+    if (!plat_exe_path(out, cap)) return 0;
+    char *cut = plat_last_sep(out);
+    if (cut) *cut = 0;
+    else if (cap < 2) return 0;
+    else strcpy(out, ".");
+    return 1;
+#endif
+}
+
 size_t plat_getenv(const char *name, char *out, size_t cap) {
     const char *v = getenv(name);
     size_t n = v ? strlen(v) : 0;
@@ -1206,6 +1696,10 @@ const char *plat_user_locale(void) {
 // Noto CJK as the common distributions and SteamOS install it; one collection covers every CJK language.
 int plat_font_path(const char *lang, char *out, size_t cap) {
     static const char *files[] = {
+#ifdef __ANDROID__
+        "/system/fonts/NotoSansCJK-Regular.ttc",
+        "/product/fonts/NotoSansCJK-Regular.ttc",
+#endif
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
@@ -1220,6 +1714,17 @@ int plat_font_path(const char *lang, char *out, size_t cap) {
 
 // PRETTY_NAME of /etc/os-release and the kernel release: "SteamOS (Linux 6.16.12-valve)".
 int plat_os_version(char *out, size_t cap) {
+#ifdef __ANDROID__
+    {
+        char rel[PROP_VALUE_MAX] = "", sdk[PROP_VALUE_MAX] = "";
+        __system_property_get("ro.build.version.release", rel);
+        __system_property_get("ro.build.version.sdk", sdk);
+        struct utsname u;
+        if (!uname(&u) && rel[0] && sdk[0])
+            return snprintf(out, cap, "Android %s (SDK %s, Linux %s)", rel, sdk, u.release) < (int)cap;
+        if (rel[0]) return snprintf(out, cap, "Android %s", rel) < (int)cap;
+    }
+#endif
     char name[128] = "Linux";
     FILE *f = fopen("/etc/os-release", "r");
     if (f) {
@@ -1314,8 +1819,15 @@ int plat_gmtime(int64_t unix_s, struct tm *out) {
 }
 
 long plat_tz_west(void) {
+#ifdef __ANDROID__
+    time_t now = time(NULL);
+    struct tm tm;
+    if (localtime_r(&now, &tm)) return -tm.tm_gmtoff;
+    return 0;
+#else
     tzset();
     return timezone;
+#endif
 }
 
 int plat_run_self(const char *env_name, const char *env_value, char *out, size_t cap, uint32_t timeout_ms) {
@@ -1442,43 +1954,71 @@ static int read_u64_file(const char *path, uint64_t *v) {
 static void find_cpu_temp(char *out, size_t cap) {
     out[0] = 0;
     DIR *d = opendir("/sys/class/hwmon");
-    if (!d) return;
-    for (struct dirent *e; (e = readdir(d));) {
-        if (e->d_name[0] == '.') continue;
-        char path[256], name[64] = "";
-        snprintf(path, sizeof path, "/sys/class/hwmon/%s/name", e->d_name);
-        FILE *f = fopen(path, "r");
-        if (!f) continue;
-        if (!fgets(name, sizeof name, f)) name[0] = 0;
-        fclose(f);
-        name[strcspn(name, "\n")] = 0;
-        int cpu = !strcmp(name, "k10temp") || !strcmp(name, "coretemp") || !strcmp(name, "zenpower");
-        snprintf(path, sizeof path, "/sys/class/hwmon/%s/temp1_input", e->d_name);
-        if ((cpu || !out[0]) && plat_file_exists(path)) snprintf(out, cap, "%s", path);
-        if (cpu && out[0]) break;
+    if (d) {
+        for (struct dirent *e; (e = readdir(d));) {
+            if (e->d_name[0] == '.') continue;
+            char path[256], name[64] = "";
+            snprintf(path, sizeof path, "/sys/class/hwmon/%s/name", e->d_name);
+            FILE *f = fopen(path, "r");
+            if (!f) continue;
+            if (!fgets(name, sizeof name, f)) name[0] = 0;
+            fclose(f);
+            name[strcspn(name, "\n")] = 0;
+            int cpu = !strcmp(name, "k10temp") || !strcmp(name, "coretemp") || !strcmp(name, "zenpower");
+            snprintf(path, sizeof path, "/sys/class/hwmon/%s/temp1_input", e->d_name);
+            if ((cpu || !out[0]) && plat_file_exists(path)) snprintf(out, cap, "%s", path);
+            if (cpu && out[0]) break;
+        }
+        closedir(d);
     }
-    closedir(d);
+#ifdef __ANDROID__
+    if (!out[0]) {
+        DIR *td = opendir("/sys/class/thermal");
+        if (td) {
+            for (struct dirent *e; (e = readdir(td));) {
+                if (strncmp(e->d_name, "thermal_zone", 12)) continue;
+                char path[256], type[64] = "";
+                snprintf(path, sizeof path, "/sys/class/thermal/%s/type", e->d_name);
+                FILE *f = fopen(path, "r");
+                if (!f) continue;
+                if (!fgets(type, sizeof type, f)) type[0] = 0;
+                fclose(f);
+                type[strcspn(type, "\r\n")] = 0;
+                int cpu = strstr(type, "cpu") != NULL || strstr(type, "cpuss") != NULL || strstr(type, "socd") != NULL;
+                snprintf(path, sizeof path, "/sys/class/thermal/%s/temp", e->d_name);
+                if ((cpu || !out[0]) && plat_file_exists(path)) snprintf(out, cap, "%s", path);
+                if (cpu && out[0]) break;
+            }
+            closedir(td);
+        }
+    }
+#endif
 }
 
 // The DRM card with gpu_busy_percent (amdgpu); with several, the one with the most VRAM in use, as the game's device
-// is not known by LUID on Linux.
+// is not known by LUID on Linux. On Qualcomm Android, fall back to /sys/class/kgsl/kgsl-3d0.
 static void find_gpu(char *out, size_t cap) {
     out[0] = 0;
     uint64_t best = 0;
     DIR *d = opendir("/sys/class/drm");
-    if (!d) return;
-    for (struct dirent *e; (e = readdir(d));) {
-        if (strncmp(e->d_name, "card", 4) || strchr(e->d_name, '-')) continue;
-        char dev[256], path[300];
-        snprintf(dev, sizeof dev, "/sys/class/drm/%s/device", e->d_name);
-        snprintf(path, sizeof path, "%s/gpu_busy_percent", dev);
-        uint64_t v, used = 0;
-        if (!read_u64_file(path, &v)) continue;
-        snprintf(path, sizeof path, "%s/mem_info_vram_used", dev);
-        read_u64_file(path, &used);
-        if (!out[0] || used > best) snprintf(out, cap, "%s", dev), best = used;
+    if (d) {
+        for (struct dirent *e; (e = readdir(d));) {
+            if (strncmp(e->d_name, "card", 4) || strchr(e->d_name, '-')) continue;
+            char dev[256], path[300];
+            snprintf(dev, sizeof dev, "/sys/class/drm/%s/device", e->d_name);
+            snprintf(path, sizeof path, "%s/gpu_busy_percent", dev);
+            uint64_t v, used = 0;
+            if (!read_u64_file(path, &v)) continue;
+            snprintf(path, sizeof path, "%s/mem_info_vram_used", dev);
+            read_u64_file(path, &used);
+            if (!out[0] || used > best) snprintf(out, cap, "%s", dev), best = used;
+        }
+        closedir(d);
     }
-    closedir(d);
+#ifdef __ANDROID__
+    if (!out[0] && plat_dir_exists("/sys/class/kgsl/kgsl-3d0"))
+        snprintf(out, cap, "/sys/class/kgsl/kgsl-3d0");
+#endif
 }
 
 PlatLoad *plat_load_open(const uint8_t *gpu_luid) {
@@ -1516,7 +2056,7 @@ void plat_cpu_load(PlatLoad *l, float *total_pct, float *proc_pct, float *temp_c
         l->busy = busy, l->total = total, l->proc_ns = pns;
     }
     uint64_t mc;
-    if (l->temp[0] && read_u64_file(l->temp, &mc)) *temp_c = (float)mc / 1000.0f;
+    if (l->temp[0] && read_u64_file(l->temp, &mc)) *temp_c = mc > 1000 ? (float)mc / 1000.0f : (float)mc;
 }
 
 void plat_gpu_load(PlatLoad *l, float *load_pct, float *vram_used_mb) {
@@ -1526,9 +2066,75 @@ void plat_gpu_load(PlatLoad *l, float *load_pct, float *vram_used_mb) {
     uint64_t v;
     snprintf(path, sizeof path, "%s/gpu_busy_percent", l->gpu);
     if (read_u64_file(path, &v)) *load_pct = (float)v;
+#ifdef __ANDROID__
+    if (*load_pct < 0) {
+        snprintf(path, sizeof path, "%s/gpu_busy_percentage", l->gpu);
+        if (read_u64_file(path, &v)) *load_pct = (float)v;
+    }
+    if (*load_pct < 0) {
+        snprintf(path, sizeof path, "%s/gpubusy", l->gpu);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            unsigned long long busy = 0, total = 0;
+            if (fscanf(f, "%llu %llu", &busy, &total) == 2 && total > 0)
+                *load_pct = 100.0f * (float)busy / (float)total;
+            fclose(f);
+        }
+    }
+#endif
     snprintf(path, sizeof path, "%s/mem_info_vram_used", l->gpu);
     if (read_u64_file(path, &v)) *vram_used_mb = (float)(v >> 20);
 }
+
+#ifdef __ANDROID__
+void plat_android_gpu_extra(PlatLoad *l, float *temp_c, float *clock_mhz) {
+    if (!l || !l->gpu[0]) return;
+    char path[300];
+    uint64_t v;
+    if (temp_c && *temp_c < 0) {
+        snprintf(path, sizeof path, "%s/temp", l->gpu);
+        if (read_u64_file(path, &v)) *temp_c = v > 1000 ? (float)v / 1000.0f : (float)v;
+    }
+    if (clock_mhz && *clock_mhz < 0) {
+        snprintf(path, sizeof path, "%s/clock_mhz", l->gpu);
+        if (read_u64_file(path, &v) && v > 0) *clock_mhz = (float)v;
+        else {
+            snprintf(path, sizeof path, "%s/gpuclk", l->gpu);
+            if (read_u64_file(path, &v) && v > 0) *clock_mhz = (float)v / 1000000.0f;
+        }
+    }
+}
+
+static void parse_proc_status_text(const char *buf, float *rss_mb, float *swap_mb, float *anon_mb) {
+    if (rss_mb) *rss_mb = -1;
+    if (swap_mb) *swap_mb = -1;
+    if (anon_mb) *anon_mb = -1;
+    if (!buf) return;
+    const char *p = buf;
+    while (*p) {
+        unsigned long long k = 0;
+        if (rss_mb && sscanf(p, "VmRSS: %llu kB", &k) == 1) *rss_mb = (float)k / 1024.0f;
+        else if (swap_mb && sscanf(p, "VmSwap: %llu kB", &k) == 1) *swap_mb = (float)k / 1024.0f;
+        else if (anon_mb && sscanf(p, "RssAnon: %llu kB", &k) == 1) *anon_mb = (float)k / 1024.0f;
+        const char *nl = strchr(p, '\n');
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
+
+void plat_android_mem_status(float *rss_mb, float *swap_mb, float *anon_mb) {
+    if (rss_mb) *rss_mb = -1;
+    if (swap_mb) *swap_mb = -1;
+    if (anon_mb) *anon_mb = -1;
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    parse_proc_status_text(buf, rss_mb, swap_mb, anon_mb);
+}
+#endif
 
 void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
     *used_mb = *total_mb = *proc_mb = -1;
@@ -1543,6 +2149,10 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
         fclose(f);
         if (total) *total_mb = (float)(total >> 10), *used_mb = (float)((total - avail) >> 10);
     }
+#ifdef __ANDROID__
+    plat_android_mem_status(proc_mb, NULL, NULL);
+    if (*proc_mb >= 0) return;
+#endif
     f = fopen("/proc/self/statm", "r");
     unsigned long long size, resident;
     if (f && fscanf(f, "%llu %llu", &size, &resident) == 2) *proc_mb = (float)(resident * (uint64_t)sysconf(_SC_PAGESIZE) >> 20);

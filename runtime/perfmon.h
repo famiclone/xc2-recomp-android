@@ -23,6 +23,7 @@ typedef struct {
     float cpu_total_pct, cpu_game_pct, cpu_temp_c;
     // memory, MB
     float ram_used_mb, ram_total_mb, ram_game_mb;
+    float ram_swap_mb, vma_alloc_mb, vma_block_mb, vma_budget_mb;
     // GPU: load and dedicated memory from the system's counters, temperature, power and clock from NVML (NVIDIA) or
     // ADL (AMD)
     char gpu_name[96];

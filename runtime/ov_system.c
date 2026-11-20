@@ -143,10 +143,17 @@ static void ov_cpu_boost(Cpu *c) {
 
 // void GetDisplayVersion(DisplayVersion *out): a 0x10-byte name, the application's display version
 static void ov_display_version(Cpu *c) {
+    extern const char rt_game_name[];
     char *out = arg_p(c, 0);
     if (!out) return;
     memset(out, 0, 0x10);
-    memcpy(out, "3.0.1", 5);
+    const char *ver = "3.0.1";
+    if (rt_game_name[0]) {
+        const char *sp = strrchr(rt_game_name, ' ');
+        const char *cand = sp ? sp + 1 : rt_game_name;
+        if (cand[0] >= '0' && cand[0] <= '9' && strlen(cand) < 0x10) ver = cand;
+    }
+    memcpy(out, ver, strlen(ver));
 }
 
 static void ov_operation_mode(Cpu *c) { ret_x(c, ov_handheld() ? 0 : 1); }
@@ -835,14 +842,10 @@ const char *ov_shared_font_dir(char *buf, size_t n) {
     const char *e = cfg_get("XC2_SHARED_FONTS");
     if (e && *e) snprintf(buf, n, "%s", e);
     else {
-        // shared-fonts next to xc2.exe (tools/package_build.py), else the repo's. exe starts empty: plat_exe_path leaves
-        // it unwritten when the path does not fit
-        char exe[PLAT_PATH_MAX] = "", probe[PLAT_PATH_MAX + 40];
-        int len = plat_exe_path(exe, sizeof exe);
-        char *cut = len && len < sizeof exe ? plat_last_sep(exe) : NULL;
-        if (cut) *cut = 0;
-        snprintf(probe, sizeof probe, "%s/shared-fonts/0-standard.bfttf", exe);
-        if (cut && plat_file_exists(probe)) snprintf(buf, n, "%s/shared-fonts", exe);
+        char dir[PLAT_PATH_MAX] = "", probe[PLAT_PATH_MAX + 40];
+        int ok = plat_data_dir(dir, sizeof dir);
+        snprintf(probe, sizeof probe, "%s/shared-fonts/0-standard.bfttf", dir);
+        if (ok && plat_file_exists(probe)) snprintf(buf, n, "%s/shared-fonts", dir);
         else snprintf(buf, n, "%s/../../firmware/shared-fonts", rt_config()->romfs);
     }
     return buf;

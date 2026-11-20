@@ -45,17 +45,21 @@ static int layer_present(const char *name) {
 // default in ~/.cache and up to 1 GB: about 35 MB in a minute of the title screen. A Deck's /home is small and the game
 // usually sits on the SD card, so unless MESA_SHADER_CACHE_DIR names a folder, it goes to mesa-cache beside the exe.
 static void mesa_cache_beside_exe(void) {
-    char dir[PLAT_PATH_MAX * 2];
+    char dir[PLAT_PATH_MAX * 2], cache[PLAT_PATH_MAX * 2 + 24];
     if (plat_getenv("MESA_SHADER_CACHE_DIR", dir, sizeof dir)) return;
-    int len = plat_exe_path(dir, sizeof dir - 16);
-    char *cut = len ? plat_last_sep(dir) : NULL;
-    if (!cut) return;
-    strcpy(cut + 1, "mesa-cache");
-    plat_setenv("MESA_SHADER_CACHE_DIR", dir);
+    if (!plat_data_dir(dir, sizeof dir)) return;
+    snprintf(cache, sizeof cache, "%s/mesa-cache", dir);
+    plat_setenv("MESA_SHADER_CACHE_DIR", cache);
 }
 
 static int create_instance(void) {
     mesa_cache_beside_exe();
+#ifdef __ANDROID__
+    if (!vk_loader_open(NULL)) {
+        rt_log("vk: cannot open Vulkan loader (libvulkan.so / XC2_VK_DRIVER)");
+        return 0;
+    }
+#endif
     const char *ext[8];
     uint32_t n_ext = (uint32_t)gfx_window_vk_extensions(ext, 7);
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
@@ -73,6 +77,9 @@ static int create_instance(void) {
     rdoc_init();
     VkResult r = vkCreateInstance(&ci, NULL, &g_vk.instance);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateInstance failed (%d); is a Vulkan 1.3 driver installed?", (int)r); return 0; }
+#ifdef __ANDROID__
+    vk_loader_load_instance(g_vk.instance);
+#endif
     g_vk.validation = validate;
     if (validate) {
         PFN_vkCreateDebugUtilsMessengerEXT f =
@@ -90,7 +97,10 @@ static int create_instance(void) {
 
 static const char *const k_required_ext[] = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-    VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME};
+#ifndef __ANDROID__
+    VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
+#endif
+};
 
 // Name of the first missing required extension, or NULL.
 static const char *missing_required(VkPhysicalDevice pd) {
@@ -191,6 +201,18 @@ static int pick_device(void) {
     return 1;
 }
 
+// Older Vulkan headers (e.g. Android NDK r26) predate VK_KHR_dynamic_rendering_local_read.
+#ifndef VK_KHR_dynamic_rendering_local_read
+#define VK_KHR_dynamic_rendering_local_read 1
+#define VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME "VK_KHR_dynamic_rendering_local_read"
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR ((VkStructureType)1000232000)
+typedef struct VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR {
+    VkStructureType sType;
+    void *pNext;
+    VkBool32 dynamicRenderingLocalRead;
+} VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR;
+#endif
+
 typedef struct {
     VkPhysicalDeviceFeatures2 f2;
     VkPhysicalDeviceVulkan11Features f11;
@@ -261,6 +283,14 @@ static int create_device(void) {
     const char *ext[28];
     uint32_t n_ext = 0;
     for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext; i++) ext[n_ext++] = k_required_ext[i];
+#ifdef __ANDROID__
+    if (has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+        g_vk.has_external_memory_host = 1;
+        ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+    }
+#else
+    g_vk.has_external_memory_host = 1;
+#endif
 
     FeatureChain *c = calloc(1, sizeof *c);
     void **tail = &c->f2.pNext;
@@ -327,12 +357,20 @@ static int create_device(void) {
     else if (!c->f13.synchronization2) miss = "synchronization2";
     else if (!h->shaderStorageImageWriteWithoutFormat) miss = "shaderStorageImageWriteWithoutFormat";
     else if (!c->clip.depthClipControl) miss = "depthClipControl";
+#ifndef __ANDROID__
     else if (!h->shaderInt64) miss = "shaderInt64";
+#endif
     else if (!h->samplerAnisotropy) miss = "samplerAnisotropy";
     else if (!h->independentBlend) miss = "independentBlend";
     else if (!h->geometryShader) miss = "geometryShader";
+#ifndef __ANDROID__
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
+#endif
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
+#ifdef __ANDROID__
+    if (!h->shaderInt64) rt_log("vk: warning: %s reports shaderInt64=0; shaders requiring 64-bit ints need Mesa Turnip", g_vk.props.deviceName);
+    if (!h->textureCompressionBC) rt_log("vk: warning: %s reports textureCompressionBC=0", g_vk.props.deviceName);
+#endif
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
@@ -371,18 +409,32 @@ static int create_device(void) {
     VkResult r = vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.device);
     free(c);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateDevice failed (%d)", (int)r); return 0; }
+#ifdef __ANDROID__
+    vk_loader_load_device(g_vk.instance, g_vk.device);
+#endif
     vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 0, &g_vk.gfx_queue);
     if (g_vk.xfer_family != g_vk.gfx_family) vkGetDeviceQueue(g_vk.device, g_vk.xfer_family, 0, &g_vk.xfer_queue);
     else { g_vk.xfer_queue = g_vk.gfx_queue; g_vk.xfer_shared = 1; }
 
-    VkPhysicalDeviceExternalMemoryHostPropertiesEXT emh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
-    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &emh};
-    vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
-    g_vk.min_imported_host_alignment = (uint32_t)emh.minImportedHostPointerAlignment;
+    if (g_vk.has_external_memory_host) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT emh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &emh};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        g_vk.min_imported_host_alignment = (uint32_t)emh.minImportedHostPointerAlignment;
+    } else {
+        g_vk.min_imported_host_alignment = 0x1000u;
+    }
     vk_caps_init(&g_vk);
 
+#ifdef __ANDROID__
+    VmaVulkanFunctions vf = {.vkGetInstanceProcAddr = vkGetInstanceProcAddr, .vkGetDeviceProcAddr = vkGetDeviceProcAddr};
+#endif
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.device, .instance = g_vk.instance,
                                  .vulkanApiVersion = VK_API_VERSION_1_3,
+#ifdef __ANDROID__
+                                 .pVulkanFunctions = &vf,
+                                 .preferredLargeHeapBlockSize = 64ull << 20,   // 64 MiB blocks on 8 GB unified RAM (vs 256 MiB desktop default)
+#endif
                                  .flags = (g_vk.has_buffer_device_address ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0) |
                                           (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0),
                                  .pDeviceMemoryCallbacks = vk_headroom_callbacks()};

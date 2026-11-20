@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "vk.h"
@@ -28,6 +29,7 @@
 
 #define ALIGN 256u
 #define MAX_RANGE (64u << 10)
+#define VBUF_MAX_RANGE (256u << 10)   // dynamic vertex streams staged in unified_vulkan mode; static geometry stays zero-copy
 // A submission's uniform ranges are a few hundred KiB (350 to 440 KiB measured), so an arena is sized to the capture:
 // the old 4 MiB minimum held 10 times the bytes it needed, and 222 of them were alive at once in issue 27.
 #define ARENA_MIN (256u << 10)
@@ -95,8 +97,16 @@ static int mode(void) {
 
 static Arena *free_arenas;
 static int free_count;            // arenas on the free list
+static uint64_t arena_live_bytes; // total bytes across all allocated arenas (in-flight + free_arenas)
 static int stopping;              // vk_usnap_shutdown ran: new arenas must not touch the allocator
 static PlatMutex free_lock = PLAT_MUTEX_INIT;
+
+static uint64_t ring_cap_bytes(void) {
+    int mb = cfg_int("XC2_RING_STAGE_MB");
+    if (mb < 32) mb = 32;
+    if (mb > 512) mb = 512;
+    return (uint64_t)mb << 20;
+}
 
 static void *grow(void *p, int *cap, size_t elem) {
     int n = *cap ? *cap * 2 : 1024;
@@ -107,22 +117,49 @@ static void *grow(void *p, int *cap, size_t elem) {
 }
 
 // Smallest free arena that fits, so a small capture does not take the one a big capture needs. A new arena is sized
-// to the capture (rounded to ARENA_GRAIN, at least ARENA_MIN).
+// to the capture (rounded to ARENA_GRAIN, at least ARENA_MIN) and bounded by XC2_RING_STAGE_MB across all live arenas.
 static Arena *arena_get(uint64_t need) {
+    uint64_t alloc_sz = (need + ARENA_GRAIN - 1) & ~(uint64_t)(ARENA_GRAIN - 1);
+    if (alloc_sz < ARENA_MIN) alloc_sz = ARENA_MIN;
+    uint64_t cap = ring_cap_bytes();
+    Arena *evict = NULL;
+    int over_cap = 0;
     plat_mutex_lock(&free_lock);
     Arena **best = NULL;
     for (Arena **pp = &free_arenas; *pp; pp = &(*pp)->next)
         if ((*pp)->size >= need && (!best || (*pp)->size < (*best)->size)) best = pp;
     Arena *a = NULL;
-    if (best) a = *best, *best = a->next, free_count--;
+    if (best) {
+        a = *best, *best = a->next, free_count--;
+    } else {
+        while (free_arenas && arena_live_bytes + alloc_sz > cap) {
+            Arena *ev = free_arenas;
+            free_arenas = ev->next, free_count--;
+            arena_live_bytes -= ev->size;
+            ev->next = evict, evict = ev;
+        }
+        if (stopping || arena_live_bytes + alloc_sz > cap) over_cap = 1;
+        else arena_live_bytes += alloc_sz;
+    }
     plat_mutex_unlock(&free_lock);
+    for (Arena *ev = evict, *next; ev; ev = next) {
+        next = ev->next;
+        vmaDestroyBuffer(vk_ctx()->vma, ev->buf, ev->alloc);
+        free(ev);
+    }
     if (a) return a;
+    if (over_cap) {
+        static int warned_cap;
+        if (!__atomic_exchange_n(&warned_cap, 1, __ATOMIC_RELAXED))
+            rt_log("vk_usnap: staging ring cap (%.0f MiB) reached: binding live memory until in-flight fences retire",
+                   cap / 1048576.0);
+        return NULL;
+    }
     a = calloc(1, sizeof *a);
     if (!a) rt_fatal("vk_usnap: out of memory");
-    a->size = (need + ARENA_GRAIN - 1) & ~(uint64_t)(ARENA_GRAIN - 1);
-    if (a->size < ARENA_MIN) a->size = ARENA_MIN;
+    a->size = alloc_sz;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = a->size,
-                             .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+                             .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT};
     // Device-local through the BAR when the device has it (the GPU reads constants on every draw), else host memory.
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
@@ -130,6 +167,9 @@ static Arena *arena_get(uint64_t need) {
     VmaAllocationInfo info;
     VkResult res = vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &a->buf, &a->alloc, &info);
     if (res != VK_SUCCESS) {
+        plat_mutex_lock(&free_lock);
+        arena_live_bytes -= alloc_sz;
+        plat_mutex_unlock(&free_lock);
         rt_log("vk_usnap: arena of %llu bytes failed (%d): this submission binds live memory",
                (unsigned long long)a->size, (int)res);
         free(a);
@@ -142,17 +182,21 @@ static Arena *arena_get(uint64_t need) {
 
 static void arena_done(void *arg) {   // completion thread (or a dropped capture): the GPU has read it
     Arena *a = arg;
+    uint64_t cap = ring_cap_bytes();
     plat_mutex_lock(&free_lock);
-    int keep = !stopping && free_count < ARENA_KEEP;   // past ARENA_KEEP the arena goes back to the allocator
+    int keep = !stopping && free_count < ARENA_KEEP && arena_live_bytes <= cap;
     if (keep) {
         a->next = free_arenas, free_arenas = a, free_count++;
         a = NULL;
+    } else {
+        arena_live_bytes -= a->size;
     }
     plat_mutex_unlock(&free_lock);
     if (a) vmaDestroyBuffer(vk_ctx()->vma, a->buf, a->alloc), free(a);
 }
 
 static void collect(const op_hdr *h, int depth) {
+    int unified = vk_mem_unified_on();
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk_usnap: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
@@ -176,6 +220,18 @@ static void collect(const op_hdr *h, int depth) {
                 if (C.ncol == C.ccol) C.col = grow(C.col, &C.ccol, sizeof *C.col);
                 uint64_t n = b->size < MAX_RANGE ? b->size : MAX_RANGE;
                 C.col[C.ncol++] = (Rng){b->addr & ~(uint64_t)(ALIGN - 1), b->addr + n};
+            }
+        }
+        if (unified && h->op == OP_BIND_VBUF) {
+            const p_bind_vbuf *vb = a;
+            if (vb->first >= 0 && vb->n > 0 && vb->first + vb->n <= 16) {
+                for (int k = 0; k < vb->n; k++) {
+                    uint64_t va = vb->r[k].address, vs = vb->r[k].size;
+                    if (va && vs && vs <= VBUF_MAX_RANGE && vk_mem_pool_dynamic(va)) {
+                        if (C.ncol == C.ccol) C.col = grow(C.col, &C.ccol, sizeof *C.col);
+                        C.col[C.ncol++] = (Rng){va & ~(uint64_t)(ALIGN - 1), va + vs};
+                    }
+                }
             }
         }
         h = nvn_op_next(h);
@@ -448,6 +504,6 @@ void vk_usnap_shutdown(void) {
     plat_mutex_lock(&free_lock);
     stopping = 1;
     for (Arena *a = free_arenas, *next; a; a = next) next = a->next, vmaDestroyBuffer(vk_ctx()->vma, a->buf, a->alloc), free(a);
-    free_arenas = NULL, free_count = 0;
+    free_arenas = NULL, free_count = 0, arena_live_bytes = 0;
     plat_mutex_unlock(&free_lock);
 }

@@ -48,12 +48,34 @@ extern const char rt_port_version[];
 void tab_cheats(float scale);   // ui/cheats_tab.cpp
 
 // Roboto Medium (Apache-2.0, ui/fonts/LICENSE-Roboto.txt) with Latin and Cyrillic glyphs.
+#if defined(__has_embed)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wc23-extensions"   // #embed in C++
 static const unsigned char roboto_ttf[] = {
 #embed "fonts/Roboto-Medium.ttf"
 };
 #pragma clang diagnostic pop
+static int roboto_ttf_size(void) { return (int)sizeof roboto_ttf; }
+#else
+// Clang < 19 (Android NDK r26/r27) predates #embed; resolve via the runtime/ include path.
+extern "C" __attribute__((visibility("hidden"))) const unsigned char xc2_roboto_ttf[];
+extern "C" __attribute__((visibility("hidden"))) const uint32_t xc2_roboto_ttf_len;
+__asm__(
+    ".section .rodata\n"
+    ".balign 8\n"
+    ".hidden xc2_roboto_ttf\n"
+    ".hidden xc2_roboto_ttf_len\n"
+    "xc2_roboto_ttf:\n"
+    ".incbin \"ui/fonts/Roboto-Medium.ttf\"\n"
+    ".Lxc2_roboto_ttf_end:\n"
+    ".balign 4\n"
+    "xc2_roboto_ttf_len:\n"
+    ".word .Lxc2_roboto_ttf_end - xc2_roboto_ttf\n"
+    ".previous\n"
+);
+#define roboto_ttf xc2_roboto_ttf
+static int roboto_ttf_size(void) { return (int)xc2_roboto_ttf_len; }
+#endif
 
 // ---- open state, any thread
 static std::atomic<int> g_open;     // the menu is open
@@ -246,6 +268,16 @@ static int vk_up(const MenuTarget *t) {
     ii.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     ii.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
     ii.PipelineRenderingCreateInfo.pColorAttachmentFormats = &g_vk_fmt;
+#ifdef __ANDROID__
+    if (!ImGui_ImplVulkan_LoadFunctions(
+            VK_API_VERSION_1_3,
+            [](const char *fn, void *ud) -> PFN_vkVoidFunction {
+                const MenuTarget *mt = (const MenuTarget *)ud;
+                return vkGetInstanceProcAddr ? vkGetInstanceProcAddr(mt->instance, fn) : nullptr;
+            },
+            (void *)t))
+        return 0;
+#endif
     if (!ImGui_ImplVulkan_Init(&ii)) return 0;
     g_vk_ok = 1;
     return 1;
@@ -266,7 +298,7 @@ static int fonts_up(float scale) {
     fa->Clear();
     ImFontConfig fc;
     fc.FontDataOwnedByAtlas = false;
-    fa->AddFontFromMemoryTTF((void *)roboto_ttf, (int)sizeof roboto_ttf, 26.0f * scale, &fc, kRanges);
+    fa->AddFontFromMemoryTTF((void *)roboto_ttf, roboto_ttf_size(), 26.0f * scale, &fc, kRanges);
     uint8_t *data[N] = {};
     ImVector<ImWchar> ranges[N];
     int merged = 0;
@@ -1242,6 +1274,41 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
         perf_cell(UI_MENU_OV_PER_FRAME, s.tex_uploads);
         ImGui::EndTable();
     }
+#ifdef __ANDROID__
+    if (s.ram_game_mb >= 0 || s.vma_block_mb >= 0) {
+        if (ImGui::BeginTable("##perfa", 2, ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("##a0", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("##a1", ImGuiTableColumnFlags_WidthFixed);
+            if (s.ram_game_mb >= 0) {
+                ImGui::TableNextColumn();
+                ImGui::TextColored(ram_c, "VmRSS / Swap");
+                ImGui::TableNextColumn();
+                char mbuf[64];
+                if (s.ram_swap_mb >= 0) snprintf(mbuf, sizeof mbuf, "%.0f / %.0f MB", s.ram_game_mb, s.ram_swap_mb);
+                else snprintf(mbuf, sizeof mbuf, "%.0f MB", s.ram_game_mb);
+                bool high_swap = s.ram_swap_mb >= 256.0f || s.ram_game_mb >= 5200.0f;
+                if (high_swap) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.55f, 0.25f, 1.0f));
+                perf_right(mbuf, false);
+                if (high_swap) ImGui::PopStyleColor();
+            }
+            if (s.vma_block_mb >= 0) {
+                ImGui::TableNextColumn();
+                ImGui::TextColored(gpu_c, "VMA Budget");
+                ImGui::TableNextColumn();
+                char vbuf[64];
+                if (s.vma_budget_mb > 0)
+                    snprintf(vbuf, sizeof vbuf, "%.0f / %.0f MB (%.1f GB)",
+                             s.vma_alloc_mb >= 0 ? s.vma_alloc_mb : s.vma_block_mb,
+                             s.vma_block_mb, s.vma_budget_mb / 1024.0f);
+                else
+                    snprintf(vbuf, sizeof vbuf, "%.0f / %.0f MB",
+                             s.vma_alloc_mb >= 0 ? s.vma_alloc_mb : s.vma_block_mb, s.vma_block_mb);
+                perf_right(vbuf, false);
+            }
+            ImGui::EndTable();
+        }
+    }
+#endif
     perf_picture(t, pic_c);
     if (s.gpu_name[0]) ImGui::TextDisabled("%s", s.gpu_name);
     if (s.cpu_name[0]) ImGui::TextDisabled("%s", s.cpu_name);

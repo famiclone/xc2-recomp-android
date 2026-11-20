@@ -11,6 +11,11 @@ extern "C" {
 // gfx_window_sdl.c
 SDL_Window *gfx_window_sdl(void);         // the game window, NULL before gfx_window_start; any thread
 double gfx_window_sdl_density(void);      // pixels per window unit (mouse positions are in units); any thread
+#ifdef __ANDROID__
+int gfx_window_sdl_android_init(void);    // SDL callback thread: initialises SDL video, Vulkan loader and user events
+void gfx_window_sdl_android_event(const SDL_Event *e);   // SDL callback thread: forwards an SDL_AppEvent
+void gfx_window_sdl_android_iterate(void);               // SDL callback thread: idle housekeeping
+#endif
 
 // input_sdl.c
 void input_sdl_window(SDL_Window *w);     // the game window was created

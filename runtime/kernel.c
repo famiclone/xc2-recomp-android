@@ -35,7 +35,11 @@
 
 #define MAX_H 4096
 #define NCORE 3
+#ifdef __ANDROID__
+#define HOST_STACK (16ull << 20)         // 16 MiB host call stack per guest thread/fiber on 8 GB / 39-bit VA Android
+#else
 #define HOST_STACK (256ull << 20)        // reserved, committed on demand
+#endif
 #define TLR_SIZE 0x200
 #define THREAD_OBJ_SIZE 0x400            // "current thread object" at TLR+0x1F8 (d2r-mobile thread.c)
 #define TLS_SIZE 0x2000
@@ -346,7 +350,11 @@ static int g_ap_log;              // redirects logged so far (AP_LOG_N)
 #define AP_LOG_N 40
 static uintptr_t g_gen_lo, g_gen_hi;   // host code of the lifted modules: first and last function start
 static uint64_t g_ap_sent, g_ap_taken, g_ap_host, g_ap_pc, g_ap_deferred, g_ap_fail, g_ap_spin_ok;
+#if defined(__aarch64__)
+void kern_ap_yield(void);
+#else
 void kern_ap_stub(void);
+#endif
 
 static void ap_init(void) {
     if (g_ap >= 0) return;
@@ -363,8 +371,13 @@ static void ap_init(void) {
                 if (f < lo) lo = f;
                 if (f > hi) hi = f;
             }
+#if defined(__aarch64__)
+        const uintptr_t host[] = {(uintptr_t)kern_ap_yield, (uintptr_t)kern_checkpoint, (uintptr_t)rt_svc,
+                                  (uintptr_t)rt_dispatch, (uintptr_t)rt_call};
+#else
         const uintptr_t host[] = {(uintptr_t)kern_ap_stub, (uintptr_t)kern_checkpoint, (uintptr_t)rt_svc,
                                   (uintptr_t)rt_dispatch, (uintptr_t)rt_call};
+#endif
         int bad = !n || lo >= hi;
         for (unsigned i = 0; i < sizeof host / sizeof *host; i++) bad |= host[i] >= lo && host[i] <= hi;
         if (bad) {
@@ -493,6 +506,91 @@ __asm__(".text\n"
         "    leaq 8(%rsp), %rsp\n"
         "    jmpq *-8(%rsp)\n"
         ".seh_endproc\n");
+#elif defined(__aarch64__)
+// AAPCS64 version: lifted ARM64 code is built with -ffixed-x15, so x15 is never live inside [g_gen_lo, g_gen_hi] and
+// carries the resume PC across the final stack restore into `br x15`. Saves volatile GPRs (x0-x14, x16, x17), x19,
+// frame/link (x29, x30), NZCV, FPCR, FPSR, and all 32 128-bit NEON registers q0-q31 (the upper 64 bits of v8-v15 are
+// volatile in AAPCS64), leaving 128 bytes untouched below the interrupted SP.
+__asm__(".text\n"
+        ".globl kern_ap_stub\n"
+        ".type kern_ap_stub, @function\n"
+        ".p2align 4\n"
+        "kern_ap_stub:\n"
+        "    .cfi_startproc\n"
+        "    sub sp, sp, #832\n"   // sub (not subs) leaves NZCV untouched; [sp+704..831] keeps 128B below entry SP clean
+        "    stp x0,  x1,  [sp, #0]\n"
+        "    stp x2,  x3,  [sp, #16]\n"
+        "    stp x4,  x5,  [sp, #32]\n"
+        "    stp x6,  x7,  [sp, #48]\n"
+        "    stp x8,  x9,  [sp, #64]\n"
+        "    stp x10, x11, [sp, #80]\n"
+        "    stp x12, x13, [sp, #96]\n"
+        "    stp x14, x16, [sp, #112]\n"
+        "    stp x17, x19, [sp, #128]\n"
+        "    stp x29, x30, [sp, #144]\n"
+        "    mrs x9,  nzcv\n"
+        "    mrs x10, fpcr\n"
+        "    mrs x11, fpsr\n"
+        "    stp x9,  x10, [sp, #160]\n"
+        "    stp x11, xzr, [sp, #176]\n"
+        "    stp q0,  q1,  [sp, #192]\n"
+        "    stp q2,  q3,  [sp, #224]\n"
+        "    stp q4,  q5,  [sp, #256]\n"
+        "    stp q6,  q7,  [sp, #288]\n"
+        "    stp q8,  q9,  [sp, #320]\n"
+        "    stp q10, q11, [sp, #352]\n"
+        "    stp q12, q13, [sp, #384]\n"
+        "    stp q14, q15, [sp, #416]\n"
+        "    stp q16, q17, [sp, #448]\n"
+        "    stp q18, q19, [sp, #480]\n"
+        "    stp q20, q21, [sp, #512]\n"
+        "    stp q22, q23, [sp, #544]\n"
+        "    stp q24, q25, [sp, #576]\n"
+        "    stp q26, q27, [sp, #608]\n"
+        "    stp q28, q29, [sp, #640]\n"
+        "    stp q30, q31, [sp, #672]\n"
+        "    msr fpcr, xzr\n"
+        "    add x29, sp, #144\n"
+        "    bl kern_ap_rip\n"
+        "    mov x19, x0\n"
+        "    str x0, [sp, #184]\n"
+        "    bl kern_ap_yield\n"
+        "    mov x15, x19\n"
+        "    ldp q0,  q1,  [sp, #192]\n"
+        "    ldp q2,  q3,  [sp, #224]\n"
+        "    ldp q4,  q5,  [sp, #256]\n"
+        "    ldp q6,  q7,  [sp, #288]\n"
+        "    ldp q8,  q9,  [sp, #320]\n"
+        "    ldp q10, q11, [sp, #352]\n"
+        "    ldp q12, q13, [sp, #384]\n"
+        "    ldp q14, q15, [sp, #416]\n"
+        "    ldp q16, q17, [sp, #448]\n"
+        "    ldp q18, q19, [sp, #480]\n"
+        "    ldp q20, q21, [sp, #512]\n"
+        "    ldp q22, q23, [sp, #544]\n"
+        "    ldp q24, q25, [sp, #576]\n"
+        "    ldp q26, q27, [sp, #608]\n"
+        "    ldp q28, q29, [sp, #640]\n"
+        "    ldp q30, q31, [sp, #672]\n"
+        "    ldp x9,  x10, [sp, #160]\n"
+        "    ldr x11, [sp, #176]\n"
+        "    msr fpcr, x10\n"
+        "    msr fpsr, x11\n"
+        "    msr nzcv, x9\n"
+        "    ldp x0,  x1,  [sp, #0]\n"
+        "    ldp x2,  x3,  [sp, #16]\n"
+        "    ldp x4,  x5,  [sp, #32]\n"
+        "    ldp x6,  x7,  [sp, #48]\n"
+        "    ldp x8,  x9,  [sp, #64]\n"
+        "    ldp x10, x11, [sp, #80]\n"
+        "    ldp x12, x13, [sp, #96]\n"
+        "    ldp x14, x16, [sp, #112]\n"
+        "    ldp x17, x19, [sp, #128]\n"
+        "    ldp x29, x30, [sp, #144]\n"
+        "    add sp, sp, #832\n"
+        "    br x15\n"
+        "    .cfi_endproc\n"
+        ".size kern_ap_stub, .-kern_ap_stub\n");
 #else
 // The System V version: rsi and rdi are volatile there too, and the interrupted code may keep data in the 128 bytes
 // below its stack pointer (the red zone), so the return slot and the saves go below that. Without a red zone in the
@@ -615,7 +713,14 @@ static int ap_try(RtThread *w) {
     } else {
         o->ap_rip = rip;
         o->ap_pending = 1;
+#if defined(__aarch64__)
+        // On ARM64 Linux/Android, intr_handler runs on the thread's signal stack with the full register file saved in
+        // ucontext_t by the kernel; calling kern_ap_yield directly before rt_sigreturn restores all 31 GPRs, NZCV and
+        // NEON state without needing a reserved scratch register for an indirect branch.
+        to = (uint64_t)(uintptr_t)kern_ap_yield;
+#else
         to = (uint64_t)(uintptr_t)kern_ap_stub;
+#endif
     }
     if (!plat_intr_resume(o->hthr, to)) {
         o->ap_pending = 0;

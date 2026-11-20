@@ -1,0 +1,131 @@
+# Code patches for XC2 2.1.0 main (recomp/patches.py, tools/xc2_titles.py). Same sets as recomp/patches-v301.txt,
+# mapped to 2.1.0's module offsets; runtime/frame_rate.c selects 2.1.0's main data offsets when main's .data begins
+# at +0xb39000.
+
+# xc2fps (XC2_FPS60, on): the frame rate of the frame limit XC2_FPS_LIMIT (frame_rate.c). Frame interval in vsyncs
+# at main+0xb74bf0 (setter main+0x6a3708, called from main+0x6e36c4 with 2 at boot); vsync period getter at
+# main+0x6bd3d0; frame-time getter main+0x6a2d4c (stored to main+0xea438c at main+0x328714); frame limiter at
+# main+0x6aa668.
+set xc2fps XC2_FPS60 1
+site xc2fps main 6e36c4 sha:727e62511f97302d 320003e0
+site xc2fps main 6bd3d4 sha:52e03e2cf63b1eb3 @page:x8 bd404100
+site xc2fps main 6aa7f8 sha:b868457ac02f8584 @page:x8 bd404900
+site xc2fps main 857ed0 sha:be49105426fb4937 @page:x9 bd405521 1e212800
+site xc2fps main 71afb8 sha:9eb7cb26cf8c7b7e 1e210800 @page:x9 bd405521 1e210800
+site xc2fps main 71c5f8 sha:6774aaeebfa5d512 1e210800 @page:x8 bd405501 1e210800
+site xc2fps main 1d105c sha:6474ca7bd27d8677 bc696900 @page:x8 bd405d01 1e210800
+site xc2fps main 1d10a8 sha:3ed0fd82d96bf0f0 bc696900 @page:x8 bd405d01 1e210800
+site xc2fps main 88826c sha:919ac3428e43aaaf @page:x8 bd406902 bd419a61 1e220821
+site xc2fps main 888454 sha:69b852fb48b15350 @page:x8 bd406900 3dc003e1 4f809021 3d8003e1 3dc007e2 4f809043 f9400e68
+site xc2fps main 888458 sha:44f1a687b3213d55 6e23dc64 4e1c1fe4 6e24d484 7e30d884 1e2e1005 1e2438a4 1e20c084 b9400919
+site xc2fps main 88845c sha:8adf88a6cace3fd9 1e21c084 0e1c3c49 12010129 1e26008a 2a09014a 4e1c1d43 3d8007e3 340003d9
+site xc2fps main 88cf24 sha:0e0f3924fef8c1b5 @page:x10 1e19e0cb 1200216b 9110014a bc6b5947 1e263926 1e2728c6
+
+# Cloud sea camera surface clamp (main+0x70f9d0).
+set xc2sea XC2_SEA_TOP 1
+site xc2sea main 70f9e0 sha:1e74171f216634b1 1e20594a 1e203950
+
+# Job wait mode-1 poll sleep: 200 us instead of 1 ms (main+0x6debfc).
+set xc2poll XC2_JOB_POLL 1
+site xc2poll main 6debfc sha:c707c9cce27c1f37 52a00060 7281a800
+
+# xc2res (XC2_OUTPUT_RES, resolution.c): composed frame size, graphics heaps and 1280x720 UI/marker space.
+set xc2res XC2_OUTPUT_RES 0
+site xc2res main 6e3748 sha:42083d975dec1472 @page:x0 b9407000
+site xc2res main 6e3750 sha:0cfa92a3c71b3e15 @page:x0 b9407400
+site xc2res main 6ffdc0 sha:c80fcae6aca575dc @page:x21 b94072b5
+site xc2res main 6ffdc4 sha:0f36dddcf93ac99d @page:x22 b94076d6
+site xc2res main 6f46f4 sha:b56a63a9639ad888 @page:x9 b9407929 d3607d29
+site xc2res main 641874 sha:8ef47547bfa87d24 @page:x8 b9407d08
+site xc2res main 832810 sha:09434673fdbacb66 2d410be0 @page:x8 bd408903 1e230800 1e230842
+site xc2res main 6c2358 sha:2b4fceb6018b7f4f @page:x9 b9408129
+site xc2res main 6c2368 sha:673c02dc4db9f003 @page:x10 b940854a
+site xc2res main 6c2378 sha:720baacc72f3a511 @page:x10 b940854a
+site xc2res main b7e08 sha:6362b897e568fd30 5280a000
+site xc2res main b7e14 sha:a70b424f5ab555f5 52805a00
+site xc2res main b7e84 sha:c01486c7a6ec88a6 5280a000
+site xc2res main b7e90 sha:a7502a87a519b5e7 52805a00
+site xc2res main b7f1c sha:02dfb985a6652948 52805a00
+site xc2res main b7f24 sha:1b598ab7db29d82f 5280a000
+site xc2res main b7f30 sha:186cd373c841a5a6 52805a00
+site xc2res main b7f90 sha:a104b71e76b791d5 5280a000
+site xc2res main b7f98 sha:fed1833c23550838 5280a000
+site xc2res main b7fa0 sha:ef0388002bc1f30a 52805a00
+site xc2res main b7fe4 sha:333d503a986778ba 52805a00
+site xc2res main b8000 sha:e7e51e9a5914d45c 5280a000
+site xc2res main b800c sha:f9779ecd170ff0fe 52805a00
+site xc2res main b8074 sha:a64455b2e72b0761 52805a00
+site xc2res main b808c sha:6a7fc9a0de5bcf6a 5280a000
+site xc2res main b8098 sha:95ef0587db1a1c35 52805a00
+site xc2res main b80f8 sha:29f32a7c23161266 5280a000
+site xc2res main b810c sha:4749a141f8fb9d94 5280a000
+site xc2res main b8120 sha:ca69dbf492ca0c88 52805a00
+site xc2res main b8170 sha:2d64719a57902b0f 5280a000
+site xc2res main b8188 sha:02d7f9ff85d19e4f 5280a000
+site xc2res main b81a0 sha:9e79b7b7ba7c2f33 52805a00
+site xc2res main c61a8 sha:1452151d9538ecee 52805a00
+site xc2res main c61b4 sha:87e2a92969db1647 5280a000
+site xc2res main c6208 sha:617bd29666ddd504 5280a000
+site xc2res main c8304 sha:b9c878049cbafcae 5280a000
+site xc2res main d0830 sha:1aa4b52ae2b75984 5280a000
+site xc2res main d0a84 sha:ddce24a2487bdd99 5280a000
+site xc2res main ef56c sha:3c976f748b77c286 5280a000
+site xc2res main ef578 sha:6ee7e3b315b3ce09 52805a00
+site xc2res main f8014 sha:4b39d059d38a2b49 5280a000
+site xc2res main f9c78 sha:f843b97cefe27f41 5280a000
+site xc2res main fde98 sha:cd643a597805bd66 5280a000
+site xc2res main fdeb0 sha:35a12db60f580cf6 5280a000
+site xc2res main fec78 sha:e67230c8587c03c5 5280a000
+site xc2res main fefa0 sha:88d92453c2cfb346 5280a000
+site xc2res main 1065ec sha:44d607792cd2434c 52805a00
+site xc2res main 1065f8 sha:a6d617bc874b2ea3 5280a000
+site xc2res main 1069b0 sha:dee553c543d45a63 52805a00
+site xc2res main 1069bc sha:54ccee57161d5150 5280a000
+site xc2res main 10728c sha:3846d23123c088de 52805a00
+site xc2res main 10d508 sha:142fd3a8d8d7e267 5280a000
+site xc2res main 111634 sha:e0657e9baab171a8 5280a000
+site xc2res main 111640 sha:9d1e74788e0d53e5 52805a00
+site xc2res main 114e40 sha:64696d74061b6477 5280a000
+site xc2res main 114e4c sha:b07897a382ff3487 52805a00
+site xc2res main 11663c sha:ae5adaf4d41ddef4 52805a00
+site xc2res main 116648 sha:29a5b28777019927 5280a000
+site xc2res main 116694 sha:c48f6d3d68527f00 5280a000
+site xc2res main 117038 sha:00a77469df76dd5c 52805a00
+site xc2res main 117044 sha:0dee6fc978bac360 5280a000
+site xc2res main 117098 sha:8c0098fd4469427d 5280a000
+site xc2res main 119b0c sha:aa42355f5832a94d 5280a000
+site xc2res main 11cc6c sha:c09c6147012b6307 5280a000
+site xc2res main 1232d0 sha:e7652630c607c439 5280a000
+site xc2res main 127754 sha:99635d8876884c18 5280a000
+site xc2res main 1333ac sha:2f3f5a6f8a9652a8 52805a00
+site xc2res main 1333b8 sha:87903fbeff2a1a99 5280a000
+site xc2res main 13349c sha:a43311501aa634c6 5280a000
+site xc2res main 1424dc sha:15b07e47441620d7 5280a000
+site xc2res main 1425b4 sha:1d3ac6af68dc3a0c 52805a00
+site xc2res main 1cd9ec sha:6758d79ca046b3a8 5280a000
+site xc2res main 1cd9f4 sha:549fa19f53dd6457 52805a00
+site xc2res main 1cf248 sha:8497197c7447acfa 5280a000
+site xc2res main 1cf254 sha:bf5a3f8664e2ab55 52805a00
+site xc2res main 1d40b8 sha:f7c04842d62130c2 5280a000
+site xc2res main 1d40c0 sha:4b243a76acd66df7 52805a00
+site xc2res main 3284d8 sha:966b3603f3b395b7 5280a000
+site xc2res main 3284e8 sha:2864148e0202c30c 52805a00
+site xc2res main 328860 sha:5a57952ebaff07a6 5280a000
+site xc2res main 328870 sha:bd1caf5e83a81377 52805a00
+
+# xc2scale (XC2_RENDER_SCALE, resolution.c): fixed 3D scene resolution scale (+0x58 of the patch page).
+set xc2scale XC2_RENDER_SCALE 0
+site xc2scale main 717454 sha:99327e39d8fa7884 @page:x10 bd405940 bd192b00
+site xc2scale main 717480 sha:cbaf5730df447e16 @page:x10 bd405940 bd192f00
+site xc2scale main 7174ac sha:f538b11b85408599 @page:x10 bd405940 bd193f00
+site xc2scale main 7174d8 sha:add69cf4c17e4248 @page:x10 bd405940 bd194300
+site xc2scale main 717538 sha:d4baac18230cfd88 @page:x10 bd405940 bd001120
+site xc2scale main 71756c sha:b293a4ecc0f3cfdd @page:x10 bd405940 bd001520
+site xc2scale main 7175a0 sha:6c937ded467437b5 @page:x10 bd405940 bd001920
+site xc2scale main 7175d4 sha:e85fdb91c376cc74 @page:x10 bd405940 bd001d20
+
+# Built-in cheats (runtime/cheats.c).
+set xc2god XC2_CHEAT_GOD_MODE 0
+site xc2god main 5b904 sha:25ddfebad5ecc05a a95a23e9 913bfa7e b94003de 130f3fde 0a1e0129
+set xc2kill XC2_CHEAT_INSTA_KILL 0
+site xc2kill main 62668 b900027b 913bfa9e b94003de 530f3fde 1adb0f69 0a0903de 131f7f69 0a2903de 5284e1e9 4b1b0129 1b096fdb b900027b

@@ -42,6 +42,14 @@ def program_nca(records, update=False):
     """
     if update:
         programs = [(r, h) for r, h in records if r['content_type'] == 0]
+        if not programs:
+            aoc = next((xc2_titles.of_aoc(r['title_id']) for r, _ in records if r['content_type'] == 5), None)
+            if aoc is not None:
+                reg, idx = aoc
+                tid = next(r['title_id'].upper() for r, _ in records if r['content_type'] == 5)
+                raise ValueError(f'Package is add-on content (DLC #{idx}, title {tid}), not update {reg.update_title}; '
+                                 f'list it under input.dlcs in config.local.toml and point input.updates at the 3.0.1 '
+                                 f'update NSP ({reg.update_title})')
         require(len(programs) == 1, 'Expected one update Program NCA; combined packages are unsupported')
         record, hdr = programs[0]
         region = xc2_titles.of_title(record['title_id'])

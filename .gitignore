@@ -18,6 +18,7 @@ __pycache__/
 # Game inputs and everything derived from them. Never commit these.
 # tools/check_content.py enforces the same rule in CI and the pre-commit hook.
 /game
+/files
 /build
 /generated
 /captures
@@ -55,6 +56,18 @@ __pycache__/
 # .NET build output of the shader translator (tools/build_xlate.py)
 /tools/xlate/bin/
 /tools/xlate/obj/
+
+# Android Gradle / NDK build outputs
+/android/.gradle
+/android/build
+/android/local.properties
+/android/app/build
+/android/app/.cxx
+/android/app/src/main/jniLibs
+/android/app/src/main/assets
+*.apk
+*.aab
+*.idsig
 
 # Coding-agent setup and working notes (skills, hooks, playbook, backlog, research notes, milestone plans): local to
 # the maintainer's machine. tools/worktree.py links .claude and notes into task worktrees.

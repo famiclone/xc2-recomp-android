@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "vk.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
@@ -24,7 +25,6 @@
 #include "input.h"
 #include "input_sdl.h"
 #include "ui/menu.h"
-#include "vk.h"
 #include "platform/platform.h"
 
 static SDL_Window *g_win;
@@ -35,6 +35,9 @@ static int g_video_ok;
 static PlatOnce g_thread_once = PLAT_ONCE_INIT;
 static uint32_t g_window_tid;            // the window thread, which runs the video calls
 static volatile int32_t g_density_milli = 1000;   // pixels per window unit, x1000
+#ifdef __ANDROID__
+static int g_android_cb_mode;            // 1 when SDL_AppInit/SDL_AppEvent drive video on SDL's callback thread
+#endif
 
 // ---- work on the window thread
 typedef struct {
@@ -148,7 +151,10 @@ static void handle(const SDL_Event *e) {
         if (g_win) apply_settings();
         return;
     }
-    if (e->type == g_ev_base + EV_CLOSE) gfx_window_closed();
+    if (e->type == g_ev_base + EV_CLOSE || e->type == SDL_EVENT_QUIT) {
+        gfx_window_closed();
+        if (!g_win) return;
+    }
     if (!g_win) return;
     input_sdl_event(e);
     menu_sdl_event(e);
@@ -178,6 +184,17 @@ static void handle(const SDL_Event *e) {
     case SDL_EVENT_WINDOW_FOCUS_LOST:
         gfx_window_focus_changed(e->type == SDL_EVENT_WINDOW_FOCUS_GAINED);
         break;
+#ifdef __ANDROID__
+    case SDL_EVENT_WILL_ENTER_BACKGROUND:
+    case SDL_EVENT_DID_ENTER_BACKGROUND:
+        gfx_window_focus_changed(0);
+        break;
+    case SDL_EVENT_DID_ENTER_FOREGROUND:
+        density_update();
+        gfx_window_mark_dirty();
+        gfx_window_focus_changed(1);
+        break;
+#endif
     case SDL_EVENT_QUIT:
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
         gfx_window_closed();
@@ -185,15 +202,37 @@ static void handle(const SDL_Event *e) {
     }
 }
 
-static void window_main(void *arg) {
-    (void)arg;
+static void init_video_on_thread(void) {
     g_window_tid = plat_thread_id();
     SDL_SetHint(SDL_HINT_APP_ID, "xc2-recomp");   // Wayland's app id: the desktop file and the taskbar match it
     SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "0");
+#ifdef __ANDROID__
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+#endif
     g_video_ok = SDL_Init(SDL_INIT_VIDEO);
     if (!g_video_ok) rt_log("gfx: SDL video init failed (%s)", SDL_GetError());
     // SDL's Vulkan queries need its Vulkan loader, which a window would load at creation: the instance and the device
     // are made before the window.
+#ifdef __ANDROID__
+    else {
+        const char *drv = cfg_get("XC2_VK_DRIVER");
+        if (drv && *drv) vk_loader_open(NULL);
+        if (!vk_loader_is_custom()) {
+            if (!SDL_Vulkan_LoadLibrary(NULL)) {
+                rt_log("gfx: SDL cannot load Vulkan (%s)", SDL_GetError());
+                g_video_ok = 0;
+            } else {
+                vk_loader_open((PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr());
+            }
+        }
+        if (g_video_ok) {
+            g_ev_base = SDL_RegisterEvents(EV_COUNT);
+            rt_log("gfx: SDL %d.%d.%d, video driver %s", SDL_VERSIONNUM_MAJOR(SDL_GetVersion()),
+                   SDL_VERSIONNUM_MINOR(SDL_GetVersion()), SDL_VERSIONNUM_MICRO(SDL_GetVersion()), SDL_GetCurrentVideoDriver());
+        }
+    }
+#else
     else if (!SDL_Vulkan_LoadLibrary(NULL)) {
         rt_log("gfx: SDL cannot load Vulkan (%s)", SDL_GetError());
         g_video_ok = 0;
@@ -202,6 +241,12 @@ static void window_main(void *arg) {
         rt_log("gfx: SDL %d.%d.%d, video driver %s", SDL_VERSIONNUM_MAJOR(SDL_GetVersion()),
                SDL_VERSIONNUM_MINOR(SDL_GetVersion()), SDL_VERSIONNUM_MICRO(SDL_GetVersion()), SDL_GetCurrentVideoDriver());
     }
+#endif
+}
+
+static void window_main(void *arg) {
+    (void)arg;
+    init_video_on_thread();
     plat_event_set(&g_video_ready);
     if (!g_video_ok) return;
     for (;;) {
@@ -213,10 +258,29 @@ static void window_main(void *arg) {
 
 static void video_start(void *arg) {
     (void)arg;
+#ifdef __ANDROID__
+    if (g_android_cb_mode) return;
+#endif
     plat_event_init(&g_video_ready, 1, 0);
     if (!plat_thread_spawn(window_main, NULL, "window", 0)) rt_fatal("gfx: cannot start the window thread");
     plat_event_wait(&g_video_ready);
 }
+
+#ifdef __ANDROID__
+int gfx_window_sdl_android_init(void) {
+    g_android_cb_mode = 1;
+    init_video_on_thread();
+    return g_video_ok;
+}
+
+void gfx_window_sdl_android_event(const SDL_Event *e) {
+    if (g_video_ok && e) handle(e);
+}
+
+void gfx_window_sdl_android_iterate(void) {
+    if (g_video_ok) input_sdl_idle();
+}
+#endif
 
 static int video_up(void) {
     plat_once(&g_thread_once, video_start, NULL);
@@ -225,6 +289,14 @@ static int video_up(void) {
 
 int gfx_window_vk_extensions(const char **out, int max) {
     if (!video_up()) return 0;
+#ifdef __ANDROID__
+    if (vk_loader_is_custom()) {
+        int k = 0;
+        if (k < max) out[k++] = VK_KHR_SURFACE_EXTENSION_NAME;
+        if (k < max) out[k++] = "VK_KHR_android_surface";
+        return k;
+    }
+#endif
     Uint32 n = 0;
     const char *const *ext = SDL_Vulkan_GetInstanceExtensions(&n);
     if (!ext) {
@@ -237,6 +309,9 @@ int gfx_window_vk_extensions(const char **out, int max) {
 }
 
 int gfx_window_vk_presentable(VkInstance inst, VkPhysicalDevice pd, uint32_t family) {
+#ifdef __ANDROID__
+    if (vk_loader_is_custom()) return video_up() != 0;
+#endif
     return video_up() && SDL_Vulkan_GetPresentationSupport(inst, pd, family);
 }
 
@@ -247,17 +322,27 @@ static void open_window(void *arg) {
     (void)arg;
     int w, h;
     gfx_cfg_window_size(&w, &h);
-    g_win = SDL_CreateWindow("XC2 Recomp", w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+#ifdef __ANDROID__
+    SDL_WindowFlags flags =
+        (vk_loader_is_custom() ? 0 : SDL_WINDOW_VULKAN) | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#else
+    SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#endif
+    g_win = SDL_CreateWindow("XC2 Recomp", w, h, flags);
     if (!g_win) {
         rt_log("gfx: SDL_CreateWindow failed (%s)", SDL_GetError());
         return;
     }
+#ifndef __ANDROID__
     set_pixel_size(w, h);   // w x h were window units; the setting is in pixels
+#endif
     density_update();
     note_applied();
     refresh_rate_update();
     if (cfg_get("XC2_BACKGROUND_WINDOW")) rt_log("gfx: XC2_BACKGROUND_WINDOW has no effect with SDL windows");
+#ifndef __ANDROID__
     if (gfx_cfg_fullscreen()) SDL_SetWindowFullscreen(g_win, true);
+#endif
     SDL_SyncWindow(g_win);
     input_sdl_window(g_win);
     open_ok = 1;
@@ -273,6 +358,16 @@ typedef struct { VkInstance inst; VkSurfaceKHR surface; } SurfaceReq;
 
 static void make_surface(void *arg) {
     SurfaceReq *r = arg;
+#ifdef __ANDROID__
+    if (vk_loader_is_custom()) {
+        void *anw = SDL_GetPointerProperty(SDL_GetWindowProperties(g_win), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+        if (!vk_loader_create_android_surface(r->inst, anw, &r->surface)) {
+            rt_log("gfx: custom driver vkCreateAndroidSurfaceKHR failed");
+            r->surface = VK_NULL_HANDLE;
+        }
+        return;
+    }
+#endif
     if (!SDL_Vulkan_CreateSurface(g_win, r->inst, NULL, &r->surface)) {
         rt_log("gfx: SDL_Vulkan_CreateSurface failed (%s)", SDL_GetError());
         r->surface = VK_NULL_HANDLE;

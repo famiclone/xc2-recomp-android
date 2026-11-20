@@ -24,6 +24,11 @@
 #include "platform/platform.h"
 #include "sysinfo.h"
 
+#ifndef _WIN32
+__attribute__((weak)) int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact);
+__attribute__((weak)) int vk_mem_vma_stats(float *alloc_mb, float *block_mb, float *budget_mb);
+#endif
+
 static PlatMutex g_lock = PLAT_MUTEX_INIT;   // everything below
 static PerfStats g_stats;                    // the machine numbers the sampler wrote; the rest is made per snapshot
 
@@ -277,6 +282,7 @@ static struct {
 static void machine_clear(PerfStats *s) {
     s->cpu_total_pct = s->cpu_game_pct = s->cpu_temp_c = -1;
     s->ram_used_mb = s->ram_total_mb = s->ram_game_mb = -1;
+    s->ram_swap_mb = s->vma_alloc_mb = s->vma_block_mb = s->vma_budget_mb = -1;
     s->gpu_pct = s->gpu_temp_c = s->gpu_power_w = s->gpu_clock_mhz = s->vram_used_mb = s->vram_total_mb = -1;
 }
 
@@ -285,6 +291,8 @@ static void machine_copy(PerfStats *d, const PerfStats *s) {
     memcpy(d->gpu_name, s->gpu_name, sizeof d->gpu_name);
     d->cpu_total_pct = s->cpu_total_pct, d->cpu_game_pct = s->cpu_game_pct, d->cpu_temp_c = s->cpu_temp_c;
     d->ram_used_mb = s->ram_used_mb, d->ram_total_mb = s->ram_total_mb, d->ram_game_mb = s->ram_game_mb;
+    d->ram_swap_mb = s->ram_swap_mb, d->vma_alloc_mb = s->vma_alloc_mb;
+    d->vma_block_mb = s->vma_block_mb, d->vma_budget_mb = s->vma_budget_mb;
     d->gpu_pct = s->gpu_pct, d->gpu_temp_c = s->gpu_temp_c, d->gpu_power_w = s->gpu_power_w;
     d->gpu_clock_mhz = s->gpu_clock_mhz, d->vram_used_mb = s->vram_used_mb, d->vram_total_mb = s->vram_total_mb;
 }
@@ -315,6 +323,21 @@ static void sampler(void *arg) {
         s.vram_total_mb = vram_total;
         nvml_sample(&s);
         adl_sample(&s);
+#ifndef _WIN32
+        if (s.vram_used_mb < 0 && vk_mem_vram) {
+            uint64_t vu = 0, vb = 0;
+            int ex = 0;
+            if (vk_mem_vram(&vu, &vb, &ex)) {
+                s.vram_used_mb = (float)(vu >> 20);
+                if (vb > 0) s.vram_total_mb = (float)(vb >> 20);
+            }
+        }
+#endif
+#ifdef __ANDROID__
+        plat_android_mem_status(&s.ram_game_mb, &s.ram_swap_mb, NULL);
+        plat_android_gpu_extra(l, &s.gpu_temp_c, &s.gpu_clock_mhz);
+        if (vk_mem_vma_stats) vk_mem_vma_stats(&s.vma_alloc_mb, &s.vma_block_mb, &s.vma_budget_mb);
+#endif
         plat_mutex_lock(&g_lock);
         machine_copy(&g_stats, &s);
         if (g_smp.want) plat_cond_wait_ns(&g_smp.cv, &g_lock, 500000000ull);

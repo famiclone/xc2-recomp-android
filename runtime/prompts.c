@@ -40,11 +40,9 @@ static const char *pick(const char **why) {
 
 // The folder of xc2.exe with its separator; 0 when the host cannot say.
 static int exe_dir(char *base, size_t cap) {
-    if (!plat_exe_path(base, cap)) return 0;
-    char *sep = plat_last_sep(base);
-    if (sep) sep[1] = 0;
-    else strcpy(base, "./");
-    return 1;
+    char dir[1024];
+    if (!plat_data_dir(dir, sizeof dir)) return 0;
+    return snprintf(base, cap, "%s/", dir) < (int)cap;
 }
 
 static void init(void *arg) {
